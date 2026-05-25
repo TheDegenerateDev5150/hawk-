@@ -62,7 +62,9 @@ public.
 `RUSTC_WORKSPACE_WRAPPER=hawk-driver`. The compiler driver is pinned to the
 workspace Rust toolchain and emits resolved graph fragments for each compiled
 workspace crate. The frontend merges those fragments and traverses from the
-selected binary entry point.
+selected binary entry point. If Cargo compiles the same workspace crate more
+than once, equivalent source declarations are merged by crate, name, kind, and
+span before diagnostics are emitted.
 
 Reference edges distinguish implementation-body reachability from public
 interface exposure. Cross-crate references from all compiled items preserve

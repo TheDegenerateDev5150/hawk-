@@ -33,7 +33,7 @@ pub struct Edge {
     pub kind: EdgeKind,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     Body,
@@ -41,7 +41,7 @@ pub enum EdgeKind {
     Reexport,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DefinitionKind {
     Function,
@@ -76,6 +76,16 @@ pub struct Finding<'a> {
     pub definition: &'a Definition,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DefinitionIdentity<'a> {
+    crate_name: &'a str,
+    name: &'a str,
+    kind: DefinitionKind,
+    file: Option<&'a str>,
+    line: Option<usize>,
+    column: Option<usize>,
+}
+
 pub fn analyze<'a>(
     fragments: &'a [Fragment],
     excluded_crates: &HashSet<String>,
@@ -89,7 +99,8 @@ pub fn analyze<'a>(
         .iter()
         .flat_map(|fragment| &fragment.edges)
         .collect();
-    let adjacency = adjacency(&edges);
+    let equivalents = equivalent_definitions(&definitions);
+    let adjacency = adjacency(&edges, &equivalents);
 
     let production_roots = fragments
         .iter()
@@ -112,9 +123,10 @@ pub fn analyze<'a>(
         .flat_map(|fragment| fragment.required_public_roots.iter().map(String::as_str))
         .collect();
     let required_public_visibility =
-        required_public_visibility(&definitions, &edges, &explicitly_required);
+        required_public_visibility(&definitions, &edges, &equivalents, &explicitly_required);
 
     let mut findings = Vec::new();
+    let mut reported = HashSet::new();
     for definition in definitions.values() {
         if !definition.public_api
             || definition.allow_dead_code
@@ -127,6 +139,10 @@ pub fn analyze<'a>(
         }
 
         if required_public_visibility.contains(definition.id.as_str()) {
+            continue;
+        }
+
+        if !reported.insert(definition_identity(definition)) {
             continue;
         }
 
@@ -160,6 +176,7 @@ pub fn analyze<'a>(
 fn required_public_visibility<'a>(
     definitions: &HashMap<&'a str, &'a Definition>,
     edges: &[&'a Edge],
+    equivalents: &HashMap<&'a str, Vec<&'a str>>,
     explicitly_required: &HashSet<&'a str>,
 ) -> HashSet<&'a str> {
     let mut required = explicitly_required.clone();
@@ -182,6 +199,12 @@ fn required_public_visibility<'a>(
                 .push(edge.to.as_str());
         }
     }
+    for (source, targets) in equivalents {
+        interface_edges
+            .entry(source)
+            .or_default()
+            .extend(targets.iter().copied());
+    }
 
     let mut pending: Vec<&str> = required.iter().copied().collect();
     while let Some(from) = pending.pop() {
@@ -197,7 +220,10 @@ fn required_public_visibility<'a>(
     required
 }
 
-fn adjacency<'a>(edges: &'a [&Edge]) -> HashMap<&'a str, Vec<&'a str>> {
+fn adjacency<'a>(
+    edges: &'a [&Edge],
+    equivalents: &HashMap<&'a str, Vec<&'a str>>,
+) -> HashMap<&'a str, Vec<&'a str>> {
     let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
     for edge in edges {
         adjacency
@@ -205,7 +231,47 @@ fn adjacency<'a>(edges: &'a [&Edge]) -> HashMap<&'a str, Vec<&'a str>> {
             .or_default()
             .push(edge.to.as_str());
     }
+    for (source, targets) in equivalents {
+        adjacency
+            .entry(source)
+            .or_default()
+            .extend(targets.iter().copied());
+    }
     adjacency
+}
+
+fn equivalent_definitions<'a>(
+    definitions: &HashMap<&'a str, &'a Definition>,
+) -> HashMap<&'a str, Vec<&'a str>> {
+    let mut groups: HashMap<DefinitionIdentity<'a>, Vec<&'a str>> = HashMap::new();
+    for definition in definitions.values() {
+        groups
+            .entry(definition_identity(definition))
+            .or_default()
+            .push(definition.id.as_str());
+    }
+
+    let mut equivalents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for group in groups.values().filter(|group| group.len() > 1) {
+        for source in group {
+            equivalents
+                .entry(source)
+                .or_default()
+                .extend(group.iter().copied().filter(|target| target != source));
+        }
+    }
+    equivalents
+}
+
+fn definition_identity<'a>(definition: &'a Definition) -> DefinitionIdentity<'a> {
+    DefinitionIdentity {
+        crate_name: &definition.crate_name,
+        name: &definition.name,
+        kind: definition.kind,
+        file: definition.span.as_ref().map(|span| span.file.as_str()),
+        line: definition.span.as_ref().map(|span| span.line),
+        column: definition.span.as_ref().map(|span| span.column),
+    }
 }
 
 fn reachable<'a>(
@@ -328,6 +394,26 @@ mod tests {
         input[0].edges.push(Edge {
             from: "unreachable_helper".into(),
             to: "entry".into(),
+            kind: EdgeKind::Body,
+        });
+
+        assert!(analyze(&input, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn duplicate_compilation_units_share_liveness() {
+        let mut input = fragments(
+            vec![
+                node("duplicate_a", "lib", true),
+                node("duplicate_b", "lib", true),
+            ],
+            vec![],
+        );
+        input[1].definitions[0].name = "duplicate".into();
+        input[1].definitions[1].name = "duplicate".into();
+        input[0].edges.push(Edge {
+            from: "main".into(),
+            to: "duplicate_b".into(),
             kind: EdgeKind::Body,
         });
 
