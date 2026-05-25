@@ -15,6 +15,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_interface::interface;
 use rustc_lint_defs::Level;
 use rustc_middle::ty::{self, TyCtxt};
+use rustc_session::config::CrateType;
 use rustc_session::lint::builtin::DEAD_CODE;
 use rustc_span::Pos;
 use rustc_span::Symbol;
@@ -92,6 +93,7 @@ fn collect_fragment(tcx: TyCtxt<'_>, crate_name: String, is_product_root: bool) 
     let mut definitions = Vec::new();
     let mut defined = HashSet::new();
     let crate_items = tcx.hir_crate_items(());
+    let is_proc_macro_crate = tcx.crate_types().contains(&CrateType::ProcMacro);
 
     for owner in crate_items.owners() {
         let def_id = owner.def_id;
@@ -216,6 +218,13 @@ fn collect_fragment(tcx: TyCtxt<'_>, crate_name: String, is_product_root: bool) 
             })
             .map(|edge| edge.to.clone()),
     );
+    required_public_roots.extend(
+        crate_items
+            .owners()
+            .map(|owner| owner.def_id)
+            .filter(|def_id| is_proc_macro_export(tcx, *def_id, is_proc_macro_crate))
+            .map(|def_id| id(tcx, def_id.to_def_id())),
+    );
     required_public_roots.sort();
     required_public_roots.dedup();
     let roots = tcx
@@ -252,6 +261,12 @@ fn is_publicly_exported(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     !tcx.def_span(def_id).from_expansion()
         && tcx.local_visibility(def_id).is_public()
         && tcx.effective_visibilities(()).is_exported(def_id)
+}
+
+fn is_proc_macro_export(tcx: TyCtxt<'_>, def_id: LocalDefId, is_proc_macro_crate: bool) -> bool {
+    is_proc_macro_crate
+        && diagnostic_kind(tcx, def_id).is_some_and(|kind| kind != DefinitionKind::Reexport)
+        && is_publicly_exported(tcx, def_id)
 }
 
 fn definition(

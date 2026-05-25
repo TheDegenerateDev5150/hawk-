@@ -36,7 +36,9 @@ fragments but do not produce diagnostics yet: rustc resolves downstream paths
 to the underlying declaration, so an export-path diagnostic cannot yet prove
 which `use` was consumed. Targets of public re-exports are treated as
 required-public roots because narrowing only the declaration fails with
-`E0365`. The MVP suggests no visibility narrower than `pub(crate)`.
+`E0365`. Proc-macro entry points are also treated as required-public roots
+because rustc requires those attributed functions to remain public. The MVP
+suggests no visibility narrower than `pub(crate)`.
 
 Fields, enum variants, and public module visibility are deferred. Direct
 trait-associated item diagnostics are represented by the containing trait,

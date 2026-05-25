@@ -7,8 +7,13 @@ name = "app"
 version = "0.1.0"
 dependencies = [
  "library",
+ "macro_dep",
 ]
 
 [[package]]
 name = "library"
+version = "0.1.0"
+
+[[package]]
+name = "macro_dep"
 version = "0.1.0"

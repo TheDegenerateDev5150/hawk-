@@ -1,4 +1,3 @@
 [workspace]
-members = ["app", "library"]
+members = ["app", "library", "macro_dep"]
 resolver = "3"
-
