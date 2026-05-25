@@ -378,4 +378,12 @@ mod tests {
 
         assert!(analyze(&input, &HashSet::new()).is_empty());
     }
+
+    #[test]
+    fn public_reexport_target_required_by_rust_visibility_is_clean() {
+        let mut input = fragments(vec![node("reexported", "lib", true)], vec![]);
+        input[1].required_public_roots.push("reexported".into());
+
+        assert!(analyze(&input, &HashSet::new()).is_empty());
+    }
 }

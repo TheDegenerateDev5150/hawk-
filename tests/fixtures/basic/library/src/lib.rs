@@ -42,6 +42,16 @@ pub fn exercise_private_context() {
     let _ = PrivateContextOptions;
 }
 
+mod exported {
+    pub struct ReexportedValue;
+}
+
+pub use exported::ReexportedValue;
+
+pub fn exercise_reexported_value() {
+    let _ = exported::ReexportedValue;
+}
+
 pub struct InternalNamespace;
 
 impl InternalNamespace {

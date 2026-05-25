@@ -98,9 +98,7 @@ fn collect_fragment(tcx: TyCtxt<'_>, crate_name: String, is_product_root: bool) 
         let kind = diagnostic_kind(tcx, def_id);
         let public_api = kind.is_some()
             && kind != Some(DefinitionKind::Reexport)
-            && !tcx.def_span(def_id).from_expansion()
-            && tcx.local_visibility(def_id).is_public()
-            && tcx.effective_visibilities(()).is_exported(def_id);
+            && is_publicly_exported(tcx, def_id);
         definitions.push(definition(
             tcx,
             def_id,
@@ -189,6 +187,24 @@ fn collect_fragment(tcx: TyCtxt<'_>, crate_name: String, is_product_root: bool) 
         .filter(|edge| edge.kind == EdgeKind::Interface && trait_impl_sources.contains(&edge.from))
         .map(|edge| edge.to.clone())
         .collect();
+    // Lowering the local target of a public reexport fails with E0365 while
+    // the reexport remains part of the crate interface.
+    let public_reexport_sources: HashSet<String> = crate_items
+        .owners()
+        .map(|owner| owner.def_id)
+        .filter(|def_id| {
+            tcx.def_kind(*def_id) == DefKind::Use && is_publicly_exported(tcx, *def_id)
+        })
+        .map(|def_id| id(tcx, def_id.to_def_id()))
+        .collect();
+    required_public_roots.extend(
+        edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::Reexport && public_reexport_sources.contains(&edge.from)
+            })
+            .map(|edge| edge.to.clone()),
+    );
     required_public_roots.sort();
     required_public_roots.dedup();
     let roots = tcx
@@ -219,6 +235,12 @@ fn collect_fragment(tcx: TyCtxt<'_>, crate_name: String, is_product_root: bool) 
         conservative_roots,
         required_public_roots,
     }
+}
+
+fn is_publicly_exported(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+    !tcx.def_span(def_id).from_expansion()
+        && tcx.local_visibility(def_id).is_public()
+        && tcx.effective_visibilities(()).is_exported(def_id)
 }
 
 fn definition(
