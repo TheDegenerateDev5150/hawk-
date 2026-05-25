@@ -8,3 +8,9 @@ fn main() {
     library::exercise_constructors();
     library::through_reexport();
 }
+
+#[allow(dead_code)]
+fn typechecked_cross_crate_references() {
+    let _ = library::TypeCheckedAcrossCrates;
+    let _ = library::PublicRenderer::render(&library::PublicRendererValue);
+}

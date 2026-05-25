@@ -110,13 +110,8 @@ pub fn analyze<'a>(
         .iter()
         .flat_map(|fragment| fragment.required_public_roots.iter().map(String::as_str))
         .collect();
-    let required_public_visibility = required_public_visibility(
-        &definitions,
-        &edges,
-        &production,
-        &retained,
-        &explicitly_required,
-    );
+    let required_public_visibility =
+        required_public_visibility(&definitions, &edges, &explicitly_required);
 
     let mut findings = Vec::new();
     for definition in definitions.values() {
@@ -164,23 +159,16 @@ pub fn analyze<'a>(
 fn required_public_visibility<'a>(
     definitions: &HashMap<&'a str, &'a Definition>,
     edges: &[&'a Edge],
-    production: &HashSet<&'a str>,
-    retained: &HashSet<&'a str>,
     explicitly_required: &HashSet<&'a str>,
 ) -> HashSet<&'a str> {
     let mut required = explicitly_required.clone();
-    required.extend(
-        edges
-            .iter()
-            .filter(|edge| {
-                production.contains(edge.from.as_str()) || retained.contains(edge.from.as_str())
-            })
-            .filter_map(|edge| {
-                let from = definitions.get(edge.from.as_str())?;
-                let to = definitions.get(edge.to.as_str())?;
-                (from.crate_name != to.crate_name).then_some(edge.to.as_str())
-            }),
-    );
+    // Rust privacy-checks every compiled item, including items outside the
+    // selected product's runtime reachability graph.
+    required.extend(edges.iter().filter_map(|edge| {
+        let from = definitions.get(edge.from.as_str())?;
+        let to = definitions.get(edge.to.as_str())?;
+        (from.crate_name != to.crate_name).then_some(edge.to.as_str())
+    }));
 
     let mut interface_edges: HashMap<&str, Vec<&str>> = HashMap::new();
     for edge in edges {
@@ -323,6 +311,21 @@ mod tests {
         let mut input = fragments(vec![node("entry", "lib", true)], vec![]);
         input[0].edges.push(Edge {
             from: "main".into(),
+            to: "entry".into(),
+            kind: EdgeKind::Body,
+        });
+
+        assert!(analyze(&input, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn typechecked_cross_crate_reference_requires_public_visibility() {
+        let mut input = fragments(vec![node("entry", "lib", true)], vec![]);
+        input[0]
+            .definitions
+            .push(node("unreachable_helper", "app", false));
+        input[0].edges.push(Edge {
+            from: "unreachable_helper".into(),
             to: "entry".into(),
             kind: EdgeKind::Body,
         });

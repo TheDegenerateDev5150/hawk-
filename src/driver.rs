@@ -360,6 +360,7 @@ impl<'tcx> ReferenceVisitor<'tcx, '_> {
         match node {
             Node::Item(item) => self.visit_item(item),
             Node::ImplItem(item) => self.visit_impl_item(item),
+            Node::TraitItem(item) => self.visit_trait_item(item),
             Node::ForeignItem(item) => self.visit_foreign_item(item),
             _ => {}
         }

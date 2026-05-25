@@ -36,6 +36,8 @@ fn diagnoses_public_surface_of_a_binary_product() {
     assert!(!stdout.contains("`ProductValue`"));
     assert!(!stdout.contains("`ContextOptions`"));
     assert!(!stdout.contains("exported::ReexportedValue"));
+    assert!(!stdout.contains("`TypeCheckedAcrossCrates`"));
+    assert!(!stdout.contains("`PublicRenderResult`"));
     assert!(!stdout.contains("{use#"));
     assert!(stdout.contains("hawk: 10 finding(s)"));
 }

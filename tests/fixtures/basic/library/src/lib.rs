@@ -52,6 +52,20 @@ pub fn exercise_reexported_value() {
     let _ = exported::ReexportedValue;
 }
 
+pub struct TypeCheckedAcrossCrates;
+
+pub trait PublicRenderer {
+    fn render(&self) -> PublicRenderResult {
+        PublicRenderResult
+    }
+}
+
+pub struct PublicRenderResult;
+
+pub struct PublicRendererValue;
+
+impl PublicRenderer for PublicRendererValue {}
+
 pub struct InternalNamespace;
 
 impl InternalNamespace {

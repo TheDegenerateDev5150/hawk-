@@ -42,11 +42,13 @@ Trait-associated item diagnostics, fields, enum variants, and public module
 visibility are deferred. Types assigned by associated type definitions in
 publicly reachable trait implementations are treated as required-public roots
 because restricting them can make the crate fail to compile (`E0446`) even
-without a product call path. Trait implementation bodies are conservatively
-rooted so indirect trait dispatch does not turn into dead-public false
-positives. Live
-cross-crate APIs do not receive diagnostics because `pub` is the narrowest
-Rust visibility available for those uses.
+without a product call path. Trait method interface edges are recorded so a
+type returned across a compiled crate boundary also remains public. Trait
+implementation bodies are conservatively rooted so indirect trait dispatch
+does not turn into dead-public false positives. Any compiled cross-crate
+reference prevents a visibility diagnostic because rustc privacy-checks dead
+items as well as production-reachable ones and `pub` is the narrowest Rust
+visibility available for those uses.
 
 Existing `dead_code` lint allowances are treated as deliberate retention. They
 do not turn dependencies into production uses: a retained public function may
@@ -62,6 +64,6 @@ workspace crate. The frontend merges those fragments and traverses from the
 selected binary entry point.
 
 Reference edges distinguish implementation-body reachability from public
-interface exposure. If a cross-crate product entry exposes another workspace
-type in its public signature, that type is retained as requiring public
-visibility.
+interface exposure. Cross-crate references from all compiled items preserve
+the referenced declaration's public visibility; interface edges then preserve
+types exposed through that declaration, including trait method return types.
