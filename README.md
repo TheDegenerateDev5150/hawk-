@@ -7,3 +7,31 @@ whose visibility exceeds the needs of the product.
 
 This repository is at the prototype stage.
 
+## Usage
+
+`hawk` is pinned to Rust 1.95.0 and uses `rustc_private`; the repository
+toolchain configuration installs `rustc-dev` when necessary.
+
+```sh
+cargo build
+./target/debug/cargo-hawk \
+  --manifest-path /path/to/workspace/Cargo.toml \
+  --package app \
+  --bin app
+```
+
+The selected binary is analyzed under `--all-features` on the host target.
+All workspace library crates compiled for that binary are considered internal
+unless exempted:
+
+```sh
+./target/debug/cargo-hawk \
+  --manifest-path /path/to/workspace/Cargo.toml \
+  --package app \
+  --bin app \
+  --exclude-crate supported_library
+```
+
+Instrumented Cargo artifacts are reused under `/private/tmp/codex-hawk-target`
+by default. Use `--target-dir` to override that location and `--graph-dir` to
+retain the compiler fragments for investigation.

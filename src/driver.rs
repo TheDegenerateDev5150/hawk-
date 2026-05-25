@@ -1,0 +1,345 @@
+use std::collections::HashSet;
+use std::env;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use anyhow::{Context, Result};
+use rustc_driver::{Callbacks, Compilation};
+use rustc_hir as hir;
+use rustc_hir::Node;
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LocalDefId};
+use rustc_hir::intravisit::{self, Visitor};
+use rustc_interface::interface;
+use rustc_lint_defs::Level;
+use rustc_middle::ty::{self, TyCtxt};
+use rustc_session::lint::builtin::DEAD_CODE;
+use rustc_span::Pos;
+use rustc_span::Symbol;
+use rustc_span::def_id::LOCAL_CRATE;
+
+use crate::graph::{Definition, DefinitionKind, Edge, EdgeKind, Fragment, Span};
+
+pub fn is_wrapper_invocation(args: &[String]) -> bool {
+    env::var_os("HAWK_OUTPUT_DIR").is_some()
+        && args
+            .get(1)
+            .and_then(|arg| Path::new(arg).file_stem())
+            .is_some_and(|stem| stem == "rustc")
+}
+
+pub fn run_wrapper(mut args: Vec<String>) -> ExitCode {
+    args.remove(1);
+    let output_dir = PathBuf::from(env::var_os("HAWK_OUTPUT_DIR").expect("HAWK_OUTPUT_DIR set"));
+    let root_crate = env::var("HAWK_ROOT_CRATE").expect("HAWK_ROOT_CRATE set");
+    let mut callbacks = HawkCallbacks {
+        output_dir,
+        root_crate,
+    };
+
+    rustc_driver::catch_with_exit_code(move || {
+        rustc_driver::run_compiler(&args, &mut callbacks);
+    })
+}
+
+struct HawkCallbacks {
+    output_dir: PathBuf,
+    root_crate: String,
+}
+
+impl Callbacks for HawkCallbacks {
+    fn config(&mut self, config: &mut interface::Config) {
+        let run_id = env::var("HAWK_RUN_ID").ok();
+        config.psess_created = Some(Box::new(move |parse_session| {
+            parse_session.env_depinfo.get_mut().insert((
+                Symbol::intern("HAWK_RUN_ID"),
+                run_id.as_deref().map(Symbol::intern),
+            ));
+        }));
+    }
+
+    fn after_analysis<'tcx>(
+        &mut self,
+        _compiler: &interface::Compiler,
+        tcx: TyCtxt<'tcx>,
+    ) -> Compilation {
+        if let Err(error) = emit_fragment(tcx, &self.root_crate, &self.output_dir) {
+            tcx.dcx()
+                .fatal(format!("hawk could not emit analysis graph: {error:#}"));
+        }
+        Compilation::Continue
+    }
+}
+
+fn emit_fragment(tcx: TyCtxt<'_>, root_crate: &str, output_dir: &Path) -> Result<()> {
+    let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
+    let is_product_root = crate_name == root_crate && tcx.entry_fn(()).is_some();
+    let fragment = collect_fragment(tcx, crate_name.clone(), is_product_root);
+    let crate_id = id(tcx, CRATE_DEF_ID.to_def_id());
+    let suffix: String = crate_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    let path = output_dir.join(format!("{crate_name}-{suffix}.json"));
+    let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
+    serde_json::to_writer(file, &fragment).with_context(|| format!("serialize {}", path.display()))
+}
+
+fn collect_fragment(tcx: TyCtxt<'_>, crate_name: String, is_product_root: bool) -> Fragment {
+    let mut definitions = Vec::new();
+    let mut defined = HashSet::new();
+    let crate_items = tcx.hir_crate_items(());
+
+    for owner in crate_items.owners() {
+        let def_id = owner.def_id;
+        let kind = diagnostic_kind(tcx, def_id);
+        let public_api = kind.is_some()
+            && !tcx.def_span(def_id).from_expansion()
+            && tcx.local_visibility(def_id).is_public()
+            && tcx.effective_visibilities(()).is_exported(def_id);
+        definitions.push(definition(
+            tcx,
+            def_id,
+            &crate_name,
+            kind.unwrap_or(DefinitionKind::Other),
+            public_api,
+        ));
+        defined.insert(def_id);
+    }
+
+    for def_id in tcx.hir_body_owners() {
+        if defined.insert(def_id) {
+            definitions.push(definition(
+                tcx,
+                def_id,
+                &crate_name,
+                DefinitionKind::Other,
+                false,
+            ));
+        }
+    }
+
+    let mut edges = Vec::new();
+    for def_id in tcx.hir_body_owners() {
+        let body = tcx.hir_body_owned_by(def_id);
+        let mut visitor = ReferenceVisitor {
+            tcx,
+            source: id(tcx, def_id.to_def_id()),
+            edge_kind: EdgeKind::Body,
+            typeck_results: Some(tcx.typeck_body(body.id())),
+            traverse_bodies: true,
+            edges: &mut edges,
+        };
+        visitor.visit_body(body);
+    }
+    for owner in crate_items.owners() {
+        let def_id = owner.def_id;
+        let mut visitor = ReferenceVisitor {
+            tcx,
+            source: id(tcx, def_id.to_def_id()),
+            edge_kind: if tcx.def_kind(def_id) == DefKind::Use {
+                EdgeKind::Reexport
+            } else {
+                EdgeKind::Interface
+            },
+            typeck_results: None,
+            traverse_bodies: false,
+            edges: &mut edges,
+        };
+        visitor.visit_node(tcx.hir_node_by_def_id(def_id));
+        if diagnostic_kind(tcx, def_id) == Some(DefinitionKind::InherentMethod)
+            && let ty::Adt(adt, _) = tcx
+                .type_of(tcx.local_parent(def_id))
+                .instantiate_identity()
+                .kind()
+        {
+            edges.push(Edge {
+                from: id(tcx, def_id.to_def_id()),
+                to: id(tcx, adt.did()),
+                kind: EdgeKind::Interface,
+            });
+        }
+    }
+
+    edges.sort_by(|left, right| {
+        (&left.from, &left.to, left.kind as u8).cmp(&(&right.from, &right.to, right.kind as u8))
+    });
+    edges.dedup_by(|left, right| {
+        left.from == right.from && left.to == right.to && left.kind == right.kind
+    });
+    let roots = tcx
+        .entry_fn(())
+        .filter(|_| is_product_root)
+        .map(|(def_id, _)| vec![id(tcx, def_id)])
+        .unwrap_or_default();
+    let conservative_roots = tcx
+        .hir_body_owners()
+        .filter(|def_id| {
+            matches!(
+                tcx.def_kind(*def_id),
+                DefKind::AssocFn | DefKind::AssocConst
+            ) && matches!(
+                tcx.def_kind(tcx.local_parent(*def_id)),
+                DefKind::Trait | DefKind::Impl { of_trait: true }
+            )
+        })
+        .map(|def_id| id(tcx, def_id.to_def_id()))
+        .collect();
+
+    Fragment {
+        crate_name,
+        is_product_root,
+        definitions,
+        edges,
+        roots,
+        conservative_roots,
+    }
+}
+
+fn definition(
+    tcx: TyCtxt<'_>,
+    def_id: LocalDefId,
+    crate_name: &str,
+    kind: DefinitionKind,
+    public_api: bool,
+) -> Definition {
+    let hir_id = tcx.local_def_id_to_hir_id(def_id);
+    let allow_dead_code = matches!(
+        tcx.lint_level_at_node(DEAD_CODE, hir_id).level,
+        Level::Allow | Level::Expect
+    );
+    Definition {
+        id: id(tcx, def_id.to_def_id()),
+        crate_name: crate_name.into(),
+        name: tcx.def_path_str(def_id.to_def_id()),
+        kind,
+        span: span(tcx, def_id),
+        public_api,
+        allow_dead_code,
+    }
+}
+
+fn diagnostic_kind(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<DefinitionKind> {
+    match tcx.def_kind(def_id) {
+        DefKind::Fn => Some(DefinitionKind::Function),
+        DefKind::Struct => Some(DefinitionKind::Struct),
+        DefKind::Enum => Some(DefinitionKind::Enum),
+        DefKind::TyAlias => Some(DefinitionKind::TypeAlias),
+        DefKind::Const => Some(DefinitionKind::Constant),
+        DefKind::Static { .. } => Some(DefinitionKind::Static),
+        DefKind::Use => Some(DefinitionKind::Reexport),
+        DefKind::AssocFn
+            if matches!(
+                tcx.def_kind(tcx.local_parent(def_id)),
+                DefKind::Impl { of_trait: false }
+            ) =>
+        {
+            Some(DefinitionKind::InherentMethod)
+        }
+        _ => None,
+    }
+}
+
+fn id(tcx: TyCtxt<'_>, def_id: DefId) -> String {
+    format!("{:?}", tcx.def_path_hash(def_id))
+}
+
+fn span(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<Span> {
+    let span = tcx.def_span(def_id);
+    if span.from_expansion() {
+        return None;
+    }
+    let location = tcx.sess.source_map().lookup_char_pos(span.lo());
+    Some(Span {
+        file: location
+            .file
+            .name
+            .prefer_local_unconditionally()
+            .to_string(),
+        line: location.line,
+        column: location.col.to_usize() + 1,
+    })
+}
+
+struct ReferenceVisitor<'tcx, 'edges> {
+    tcx: TyCtxt<'tcx>,
+    source: String,
+    edge_kind: EdgeKind,
+    typeck_results: Option<&'tcx ty::TypeckResults<'tcx>>,
+    traverse_bodies: bool,
+    edges: &'edges mut Vec<Edge>,
+}
+
+impl<'tcx> ReferenceVisitor<'tcx, '_> {
+    fn record(&mut self, resolution: Res) {
+        match resolution {
+            Res::Def(_, def_id) => self.edges.push(Edge {
+                from: self.source.clone(),
+                to: id(self.tcx, def_id),
+                kind: self.edge_kind,
+            }),
+            Res::SelfTyParam { trait_ } => self.edges.push(Edge {
+                from: self.source.clone(),
+                to: id(self.tcx, trait_),
+                kind: self.edge_kind,
+            }),
+            Res::SelfTyAlias { alias_to, .. } => self.edges.push(Edge {
+                from: self.source.clone(),
+                to: id(self.tcx, alias_to),
+                kind: self.edge_kind,
+            }),
+            _ => {}
+        }
+    }
+
+    fn visit_node(&mut self, node: Node<'tcx>) {
+        match node {
+            Node::Item(item) => self.visit_item(item),
+            Node::ImplItem(item) => self.visit_impl_item(item),
+            Node::ForeignItem(item) => self.visit_foreign_item(item),
+            _ => {}
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for ReferenceVisitor<'tcx, '_> {
+    fn visit_nested_body(&mut self, body_id: hir::BodyId) {
+        if !self.traverse_bodies {
+            return;
+        }
+        let previous = self.typeck_results.replace(self.tcx.typeck_body(body_id));
+        self.visit_body(self.tcx.hir_body(body_id));
+        self.typeck_results = previous;
+    }
+
+    fn visit_path(&mut self, path: &hir::Path<'tcx>, hir_id: hir::HirId) {
+        self.record(path.res);
+        intravisit::walk_path(self, path);
+        let _ = hir_id;
+    }
+
+    fn visit_expr(&mut self, expression: &'tcx hir::Expr<'tcx>) {
+        if let Some(typeck_results) = self.typeck_results {
+            match expression.kind {
+                hir::ExprKind::Path(ref qpath @ hir::QPath::TypeRelative(..)) => {
+                    self.record(typeck_results.qpath_res(qpath, expression.hir_id));
+                }
+                hir::ExprKind::Struct(qpath @ hir::QPath::TypeRelative(..), ..) => {
+                    self.record(typeck_results.qpath_res(qpath, expression.hir_id));
+                }
+                hir::ExprKind::MethodCall(..) => {
+                    if let Some(def_id) = typeck_results.type_dependent_def_id(expression.hir_id) {
+                        self.edges.push(Edge {
+                            from: self.source.clone(),
+                            to: id(self.tcx, def_id),
+                            kind: self.edge_kind,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        intravisit::walk_expr(self, expression);
+    }
+}

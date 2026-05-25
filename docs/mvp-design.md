@@ -31,12 +31,16 @@ for follow-up machine-applicable fixes.
 ## Initial scope
 
 The MVP includes free functions, inherent methods and associated functions,
-named types, constants, statics, and public re-exports. It suggests no
-visibility narrower than `pub(crate)`.
+named types, constants, and statics. Public re-exports are collected, but the
+diagnostic is conservative when rustc has resolved a downstream path directly
+to its underlying declaration. It suggests no visibility narrower than
+`pub(crate)`.
 
-Trait-associated items, fields, enum variants, and module dead-code cascades
-are deferred. Live cross-crate APIs do not receive diagnostics because `pub`
-is the narrowest Rust visibility available for those uses.
+Trait-associated items, fields, enum variants, and public module visibility are
+deferred. Trait implementation bodies are conservatively rooted so indirect
+trait dispatch does not turn into dead-public false positives. Live
+cross-crate APIs do not receive diagnostics because `pub` is the narrowest
+Rust visibility available for those uses.
 
 Existing `dead_code` lint allowances are treated as deliberate retention. They
 do not turn dependencies into production uses: a retained public function may
@@ -51,3 +55,7 @@ workspace Rust toolchain and emits resolved graph fragments for each compiled
 workspace crate. The frontend merges those fragments and traverses from the
 selected binary entry point.
 
+Reference edges distinguish implementation-body reachability from public
+interface exposure. If a cross-crate product entry exposes another workspace
+type in its public signature, that type is retained as requiring public
+visibility.

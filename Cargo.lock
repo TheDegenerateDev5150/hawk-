@@ -84,7 +84,6 @@ name = "cargo-hawk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "camino",
  "cargo_metadata",
  "clap",
  "serde",
