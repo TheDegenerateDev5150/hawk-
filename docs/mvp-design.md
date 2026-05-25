@@ -37,9 +37,13 @@ to the underlying declaration, so an export-path diagnostic cannot yet prove
 which `use` was consumed. The MVP suggests no visibility narrower than
 `pub(crate)`.
 
-Trait-associated items, fields, enum variants, and public module visibility are
-deferred. Trait implementation bodies are conservatively rooted so indirect
-trait dispatch does not turn into dead-public false positives. Live
+Trait-associated item diagnostics, fields, enum variants, and public module
+visibility are deferred. Types assigned by associated type definitions in
+publicly reachable trait implementations are treated as required-public roots
+because restricting them can make the crate fail to compile (`E0446`) even
+without a product call path. Trait implementation bodies are conservatively
+rooted so indirect trait dispatch does not turn into dead-public false
+positives. Live
 cross-crate APIs do not receive diagnostics because `pub` is the narrowest
 Rust visibility available for those uses.
 

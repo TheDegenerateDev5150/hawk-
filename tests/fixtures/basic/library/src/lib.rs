@@ -10,6 +10,38 @@ pub fn product_value() -> ProductValue {
     ProductValue
 }
 
+pub trait ProductContext {
+    type Options;
+}
+
+pub struct Context;
+
+pub struct ContextOptions;
+
+impl ProductContext for Context {
+    type Options = ContextOptions;
+}
+
+pub fn product_context() -> Context {
+    Context
+}
+
+trait PrivateContext {
+    type Options;
+}
+
+struct PrivateContextValue;
+
+pub struct PrivateContextOptions;
+
+impl PrivateContext for PrivateContextValue {
+    type Options = PrivateContextOptions;
+}
+
+pub fn exercise_private_context() {
+    let _ = PrivateContextOptions;
+}
+
 pub struct InternalNamespace;
 
 impl InternalNamespace {

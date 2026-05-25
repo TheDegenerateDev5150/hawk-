@@ -32,7 +32,9 @@ fn diagnoses_public_surface_of_a_binary_product() {
     assert!(stdout.contains("hawk::unnecessary_public: `retained_helper`"));
     assert!(stdout.contains("hawk::unnecessary_public: `ConstructedTuple`"));
     assert!(stdout.contains("hawk::unnecessary_public: `ConstructedEnum`"));
+    assert!(stdout.contains("hawk::unnecessary_public: `PrivateContextOptions`"));
     assert!(!stdout.contains("`ProductValue`"));
+    assert!(!stdout.contains("`ContextOptions`"));
     assert!(!stdout.contains("{use#"));
-    assert!(stdout.contains("hawk: 9 finding(s)"));
+    assert!(stdout.contains("hawk: 10 finding(s)"));
 }

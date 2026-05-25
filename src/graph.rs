@@ -11,6 +11,8 @@ pub struct Fragment {
     pub roots: Vec<String>,
     #[serde(default)]
     pub conservative_roots: Vec<String>,
+    #[serde(default)]
+    pub required_public_roots: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -104,8 +106,17 @@ pub fn analyze<'a>(
         .filter(|definition| definition.public_api && definition.allow_dead_code)
         .map(|definition| definition.id.as_str());
     let retained = reachable(retained_roots, &adjacency);
-    let required_across_crates =
-        required_across_crates(&definitions, &edges, &production, &retained);
+    let explicitly_required: HashSet<&str> = fragments
+        .iter()
+        .flat_map(|fragment| fragment.required_public_roots.iter().map(String::as_str))
+        .collect();
+    let required_public_visibility = required_public_visibility(
+        &definitions,
+        &edges,
+        &production,
+        &retained,
+        &explicitly_required,
+    );
 
     let mut findings = Vec::new();
     for definition in definitions.values() {
@@ -119,6 +130,10 @@ pub fn analyze<'a>(
             continue;
         }
 
+        if required_public_visibility.contains(definition.id.as_str()) {
+            continue;
+        }
+
         let is_production_live = production.contains(definition.id.as_str());
         let is_retained = retained.contains(definition.id.as_str());
         if !is_production_live && !is_retained {
@@ -129,12 +144,10 @@ pub fn analyze<'a>(
             continue;
         }
 
-        if !required_across_crates.contains(definition.id.as_str()) {
-            findings.push(Finding {
-                kind: FindingKind::UnnecessaryPublic,
-                definition,
-            });
-        }
+        findings.push(Finding {
+            kind: FindingKind::UnnecessaryPublic,
+            definition,
+        });
     }
 
     findings.sort_by_key(|finding| {
@@ -148,23 +161,26 @@ pub fn analyze<'a>(
     findings
 }
 
-fn required_across_crates<'a>(
+fn required_public_visibility<'a>(
     definitions: &HashMap<&'a str, &'a Definition>,
     edges: &[&'a Edge],
     production: &HashSet<&'a str>,
     retained: &HashSet<&'a str>,
+    explicitly_required: &HashSet<&'a str>,
 ) -> HashSet<&'a str> {
-    let mut required: HashSet<&str> = edges
-        .iter()
-        .filter(|edge| {
-            production.contains(edge.from.as_str()) || retained.contains(edge.from.as_str())
-        })
-        .filter_map(|edge| {
-            let from = definitions.get(edge.from.as_str())?;
-            let to = definitions.get(edge.to.as_str())?;
-            (from.crate_name != to.crate_name).then_some(edge.to.as_str())
-        })
-        .collect();
+    let mut required = explicitly_required.clone();
+    required.extend(
+        edges
+            .iter()
+            .filter(|edge| {
+                production.contains(edge.from.as_str()) || retained.contains(edge.from.as_str())
+            })
+            .filter_map(|edge| {
+                let from = definitions.get(edge.from.as_str())?;
+                let to = definitions.get(edge.to.as_str())?;
+                (from.crate_name != to.crate_name).then_some(edge.to.as_str())
+            }),
+    );
 
     let mut interface_edges: HashMap<&str, Vec<&str>> = HashMap::new();
     for edge in edges {
@@ -245,6 +261,7 @@ mod tests {
                 edges: vec![],
                 roots: vec!["main".into()],
                 conservative_roots: vec![],
+                required_public_roots: vec![],
             },
             Fragment {
                 crate_name: "lib".into(),
@@ -253,6 +270,7 @@ mod tests {
                 edges,
                 roots: vec![],
                 conservative_roots: vec![],
+                required_public_roots: vec![],
             },
         ]
     }
@@ -349,6 +367,14 @@ mod tests {
             to: "factory".into(),
             kind: EdgeKind::Body,
         });
+
+        assert!(analyze(&input, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn trait_interface_type_required_by_rust_visibility_is_clean() {
+        let mut input = fragments(vec![node("options", "lib", true)], vec![]);
+        input[1].required_public_roots.push("options".into());
 
         assert!(analyze(&input, &HashSet::new()).is_empty());
     }
