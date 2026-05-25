@@ -1,0 +1,53 @@
+# MVP design
+
+## Product model
+
+The analyzed unit is one explicitly selected Cargo binary target. All
+workspace library dependencies compiled into that binary are considered
+closed-world unless their crates are explicitly excluded.
+
+The MVP analyzes:
+
+- one binary target;
+- `--all-features`;
+- the host target;
+- production reachability only.
+
+Alternate products, platform configurations, and test-only reachability are
+future analysis modes rather than implicit roots.
+
+## Diagnostics
+
+The selected binary seeds reachability but does not itself receive `hawk`
+diagnostics. Compiled workspace library dependencies can produce:
+
+- dead public surface: a public declaration is not reachable from the product;
+- unnecessary public visibility: a live public declaration has no live
+  cross-crate consumer and can be restricted to `pub(crate)`.
+
+The MVP is diagnostic-only. It retains declaration spans and reasoning needed
+for follow-up machine-applicable fixes.
+
+## Initial scope
+
+The MVP includes free functions, inherent methods and associated functions,
+named types, constants, statics, and public re-exports. It suggests no
+visibility narrower than `pub(crate)`.
+
+Trait-associated items, fields, enum variants, and module dead-code cascades
+are deferred. Live cross-crate APIs do not receive diagnostics because `pub`
+is the narrowest Rust visibility available for those uses.
+
+Existing `dead_code` lint allowances are treated as deliberate retention. They
+do not turn dependencies into production uses: a retained public function may
+still reveal that a public helper it uses only internally does not need to be
+public.
+
+## Implementation direction
+
+`cargo hawk` invokes the selected Cargo build with
+`RUSTC_WORKSPACE_WRAPPER=hawk-driver`. The compiler driver is pinned to the
+workspace Rust toolchain and emits resolved graph fragments for each compiled
+workspace crate. The frontend merges those fragments and traverses from the
+selected binary entry point.
+

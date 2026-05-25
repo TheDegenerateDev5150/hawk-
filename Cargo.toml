@@ -1,0 +1,21 @@
+[package]
+name = "cargo-hawk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Closed-world public API lints for Cargo binary products"
+
+[[bin]]
+name = "cargo-hawk"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.98"
+camino = "1.1.10"
+cargo_metadata = "0.20.0"
+clap = { version = "4.5.40", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tempfile = "3.20.0"
+
