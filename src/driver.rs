@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs::File;
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -8,7 +9,7 @@ use anyhow::{Context, Result};
 use rustc_driver::{Callbacks, Compilation};
 use rustc_hir as hir;
 use rustc_hir::Node;
-use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_interface::interface;
@@ -83,7 +84,8 @@ fn emit_fragment(tcx: TyCtxt<'_>, root_crate: &str, output_dir: &Path) -> Result
         .collect();
     let path = output_dir.join(format!("{crate_name}-{suffix}.json"));
     let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
-    serde_json::to_writer(file, &fragment).with_context(|| format!("serialize {}", path.display()))
+    serde_json::to_writer(BufWriter::new(file), &fragment)
+        .with_context(|| format!("serialize {}", path.display()))
 }
 
 fn collect_fragment(tcx: TyCtxt<'_>, crate_name: String, is_product_root: bool) -> Fragment {
@@ -95,6 +97,7 @@ fn collect_fragment(tcx: TyCtxt<'_>, crate_name: String, is_product_root: bool) 
         let def_id = owner.def_id;
         let kind = diagnostic_kind(tcx, def_id);
         let public_api = kind.is_some()
+            && kind != Some(DefinitionKind::Reexport)
             && !tcx.def_span(def_id).from_expansion()
             && tcx.local_visibility(def_id).is_public()
             && tcx.effective_visibilities(()).is_exported(def_id);
@@ -274,6 +277,15 @@ struct ReferenceVisitor<'tcx, 'edges> {
 impl<'tcx> ReferenceVisitor<'tcx, '_> {
     fn record(&mut self, resolution: Res) {
         match resolution {
+            Res::Def(DefKind::Ctor(CtorOf::Struct, ..), constructor) => {
+                self.record_def(self.tcx.parent(constructor));
+            }
+            Res::Def(DefKind::Ctor(CtorOf::Variant, ..), constructor) => {
+                self.record_def(self.tcx.parent(self.tcx.parent(constructor)));
+            }
+            Res::Def(DefKind::Variant, variant) => {
+                self.record_def(self.tcx.parent(variant));
+            }
             Res::Def(_, def_id) => self.edges.push(Edge {
                 from: self.source.clone(),
                 to: id(self.tcx, def_id),
@@ -291,6 +303,14 @@ impl<'tcx> ReferenceVisitor<'tcx, '_> {
             }),
             _ => {}
         }
+    }
+
+    fn record_def(&mut self, def_id: DefId) {
+        self.edges.push(Edge {
+            from: self.source.clone(),
+            to: id(self.tcx, def_id),
+            kind: self.edge_kind,
+        });
     }
 
     fn visit_node(&mut self, node: Node<'tcx>) {

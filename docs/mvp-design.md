@@ -31,9 +31,10 @@ for follow-up machine-applicable fixes.
 ## Initial scope
 
 The MVP includes free functions, inherent methods and associated functions,
-named types, constants, and statics. Public re-exports are collected, but the
-diagnostic is conservative when rustc has resolved a downstream path directly
-to its underlying declaration. It suggests no visibility narrower than
+named types, constants, and statics. Public re-exports are recorded in graph
+fragments but do not produce diagnostics yet: rustc resolves downstream paths
+to the underlying declaration, so an export-path diagnostic cannot yet prove
+which `use` was consumed. The MVP suggests no visibility narrower than
 `pub(crate)`.
 
 Trait-associated items, fields, enum variants, and public module visibility are

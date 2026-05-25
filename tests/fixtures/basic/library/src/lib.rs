@@ -22,6 +22,25 @@ pub fn use_namespace() {
     InternalNamespace::live_inside_crate();
 }
 
+pub struct ConstructedTuple(u8);
+
+pub enum ConstructedEnum {
+    Active,
+}
+
+pub fn exercise_constructors() {
+    let tuple = ConstructedTuple(1);
+    let ConstructedTuple(value) = tuple;
+    let _ = value;
+    let _ = ConstructedEnum::Active;
+}
+
+mod export_target {
+    pub fn through_reexport() {}
+}
+
+pub use export_target::through_reexport;
+
 pub fn dead_entry() {
     dead_helper();
 }

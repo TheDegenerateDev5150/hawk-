@@ -30,6 +30,9 @@ fn diagnoses_public_surface_of_a_binary_product() {
     assert!(stdout.contains("hawk::dead_public: `dead_entry`"));
     assert!(stdout.contains("hawk::dead_public: `InternalNamespace::dead_method`"));
     assert!(stdout.contains("hawk::unnecessary_public: `retained_helper`"));
+    assert!(stdout.contains("hawk::unnecessary_public: `ConstructedTuple`"));
+    assert!(stdout.contains("hawk::unnecessary_public: `ConstructedEnum`"));
     assert!(!stdout.contains("`ProductValue`"));
-    assert!(stdout.contains("hawk: 7 finding(s)"));
+    assert!(!stdout.contains("{use#"));
+    assert!(stdout.contains("hawk: 9 finding(s)"));
 }

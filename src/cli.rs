@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,7 +47,14 @@ pub fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
     if raw_args.get(1).is_some_and(|argument| argument == "hawk") {
         raw_args.remove(1);
     }
-    let args = Args::try_parse_from(raw_args)?;
+    let args = match Args::try_parse_from(raw_args) {
+        Ok(args) => args,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            error.print().context("print command-line help")?;
+            return Ok(ExitCode::from(exit_code as u8));
+        }
+    };
     let metadata = MetadataCommand::new()
         .manifest_path(&args.manifest_path)
         .no_deps()
@@ -97,6 +105,7 @@ pub fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         .arg("--bin")
         .arg(&args.bin)
         .arg("--all-features")
+        .arg("--locked")
         .arg("--target-dir")
         .arg(&target_dir)
         .env("RUSTC_WORKSPACE_WRAPPER", executable)
@@ -204,7 +213,7 @@ fn read_fragments(graph_dir: &Path) -> Result<Vec<Fragment>> {
             let file =
                 File::open(&path).with_context(|| format!("open fragment {}", path.display()))?;
             fragments.push(
-                serde_json::from_reader(file)
+                serde_json::from_reader(BufReader::new(file))
                     .with_context(|| format!("deserialize fragment {}", path.display()))?,
             );
         }

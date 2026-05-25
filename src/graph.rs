@@ -121,17 +121,6 @@ pub fn analyze<'a>(
 
         let is_production_live = production.contains(definition.id.as_str());
         let is_retained = retained.contains(definition.id.as_str());
-        if definition.kind == DefinitionKind::Reexport
-            && edges.iter().any(|edge| {
-                edge.from == definition.id
-                    && (!definitions.contains_key(edge.to.as_str())
-                        || required_across_crates.contains(edge.to.as_str()))
-            })
-        {
-            // rustc resolves downstream references to the target declaration rather
-            // than the `use` owner, so a required target may have used this path.
-            continue;
-        }
         if !is_production_live && !is_retained {
             findings.push(Finding {
                 kind: FindingKind::DeadPublic,
@@ -177,20 +166,30 @@ fn required_across_crates<'a>(
         })
         .collect();
 
-    loop {
-        let mut changed = false;
-        for edge in edges {
-            if matches!(edge.kind, EdgeKind::Interface | EdgeKind::Reexport)
-                && required.contains(edge.from.as_str())
-                && definitions.contains_key(edge.to.as_str())
-            {
-                changed |= required.insert(edge.to.as_str());
-            }
-        }
-        if !changed {
-            return required;
+    let mut interface_edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in edges {
+        if matches!(edge.kind, EdgeKind::Interface | EdgeKind::Reexport)
+            && definitions.contains_key(edge.to.as_str())
+        {
+            interface_edges
+                .entry(edge.from.as_str())
+                .or_default()
+                .push(edge.to.as_str());
         }
     }
+
+    let mut pending: Vec<&str> = required.iter().copied().collect();
+    while let Some(from) = pending.pop() {
+        if let Some(targets) = interface_edges.get(from) {
+            for target in targets {
+                if required.insert(target) {
+                    pending.push(target);
+                }
+            }
+        }
+    }
+
+    required
 }
 
 fn adjacency<'a>(edges: &'a [&Edge]) -> HashMap<&'a str, Vec<&'a str>> {

@@ -11,6 +11,8 @@ This repository is at the prototype stage.
 
 `hawk` is pinned to Rust 1.95.0 and uses `rustc_private`; the repository
 toolchain configuration installs `rustc-dev` when necessary.
+The build embeds the selected compiler sysroot runtime path so the resulting
+executable can run directly as Cargo's compiler wrapper.
 
 ```sh
 cargo build
@@ -20,9 +22,9 @@ cargo build
   --bin app
 ```
 
-The selected binary is analyzed under `--all-features` on the host target.
-All workspace library crates compiled for that binary are considered internal
-unless exempted:
+The selected binary is analyzed under `--all-features --locked` on the host
+target. All workspace library crates compiled for that binary are considered
+internal unless exempted:
 
 ```sh
 ./target/debug/cargo-hawk \
