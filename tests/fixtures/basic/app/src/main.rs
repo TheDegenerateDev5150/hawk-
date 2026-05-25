@@ -7,6 +7,7 @@ fn main() {
     library::use_namespace();
     library::exercise_constructors();
     library::through_reexport();
+    library::exercise_internal_trait();
 }
 
 #[allow(dead_code)]

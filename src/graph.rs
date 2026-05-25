@@ -46,6 +46,7 @@ pub enum EdgeKind {
 pub enum DefinitionKind {
     Function,
     InherentMethod,
+    Trait,
     Struct,
     Enum,
     TypeAlias,
@@ -388,5 +389,27 @@ mod tests {
         input[1].required_public_roots.push("reexported".into());
 
         assert!(analyze(&input, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn live_trait_item_keeps_containing_trait_live() {
+        let mut input = fragments(
+            vec![node("extension_trait", "lib", true)],
+            vec![Edge {
+                from: "extension_method".into(),
+                to: "extension_trait".into(),
+                kind: EdgeKind::Interface,
+            }],
+        );
+        input[1]
+            .definitions
+            .push(node("extension_method", "lib", false));
+        input[1].conservative_roots.push("extension_method".into());
+
+        let findings = analyze(&input, &HashSet::new());
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, FindingKind::UnnecessaryPublic);
+        assert_eq!(findings[0].definition.id, "extension_trait");
     }
 }

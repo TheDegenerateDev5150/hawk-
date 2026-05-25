@@ -66,6 +66,22 @@ pub struct PublicRendererValue;
 
 impl PublicRenderer for PublicRendererValue {}
 
+pub trait InternalRenderer {
+    fn render(&self) -> InternalRenderResult {
+        InternalRenderResult
+    }
+}
+
+pub struct InternalRenderResult;
+
+struct InternalRendererValue;
+
+impl InternalRenderer for InternalRendererValue {}
+
+pub fn exercise_internal_trait() {
+    let _ = InternalRendererValue.render();
+}
+
 pub struct InternalNamespace;
 
 impl InternalNamespace {

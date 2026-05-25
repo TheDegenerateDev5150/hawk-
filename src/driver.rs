@@ -161,6 +161,17 @@ fn collect_fragment(tcx: TyCtxt<'_>, crate_name: String, is_product_root: bool) 
                 kind: EdgeKind::Interface,
             });
         }
+        if matches!(
+            tcx.def_kind(def_id),
+            DefKind::AssocFn | DefKind::AssocConst | DefKind::AssocTy
+        ) && matches!(tcx.def_kind(tcx.local_parent(def_id)), DefKind::Trait)
+        {
+            edges.push(Edge {
+                from: id(tcx, def_id.to_def_id()),
+                to: id(tcx, tcx.local_parent(def_id).to_def_id()),
+                kind: EdgeKind::Interface,
+            });
+        }
     }
 
     edges.sort_by(|left, right| {
@@ -269,6 +280,7 @@ fn definition(
 fn diagnostic_kind(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<DefinitionKind> {
     match tcx.def_kind(def_id) {
         DefKind::Fn => Some(DefinitionKind::Function),
+        DefKind::Trait => Some(DefinitionKind::Trait),
         DefKind::Struct => Some(DefinitionKind::Struct),
         DefKind::Enum => Some(DefinitionKind::Enum),
         DefKind::TyAlias => Some(DefinitionKind::TypeAlias),
