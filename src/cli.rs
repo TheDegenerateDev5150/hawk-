@@ -348,6 +348,17 @@ fn write_diagnostic(
     level: LintLevel,
 ) -> std::fmt::Result {
     let (message, help, marker) = match (finding.kind, finding.definition.kind) {
+        (FindingKind::DeadPublic, DefinitionKind::EnumVariant) => (
+            format!(
+                "`{}` is a public enum variant but is not reachable from binary `{binary}`",
+                finding.definition.name
+            ),
+            "remove this variant",
+            "public enum variant",
+        ),
+        (FindingKind::UnnecessaryPublic, DefinitionKind::EnumVariant) => {
+            unreachable!("live enum variants do not have actionable visibility findings")
+        }
         (FindingKind::DeadPublic, DefinitionKind::Reexport) => (
             format!(
                 "public re-export `{}` has no target reachable from binary `{binary}`",
@@ -709,6 +720,41 @@ mod tests {
           = help: change this declaration to `pub(crate)`
 
         "###);
+    }
+
+    #[test]
+    fn dead_enum_variant_diagnostic_suggests_a_valid_remediation() {
+        let definition = Definition {
+            id: "InternalState::Active".into(),
+            crate_name: "library".into(),
+            name: "InternalState::Active".into(),
+            kind: DefinitionKind::EnumVariant,
+            span: None,
+            public_api: true,
+        };
+        let finding = Finding {
+            kind: FindingKind::DeadPublic,
+            definition: &definition,
+        };
+        let mut output = String::new();
+
+        write_diagnostic(
+            &mut output,
+            &finding,
+            "app",
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            LintLevel::Warn,
+        )
+        .expect("render diagnostic");
+
+        let output = anstream::adapter::strip_str(&output).to_string();
+        insta::assert_snapshot!(output, @r###"
+        warning[hawk::dead_public]: `InternalState::Active` is a public enum variant but is not reachable from binary `app`
+          = note: declaration in crate `library`
+          = help: remove this variant
+
+        "###);
+        assert!(!output.contains("pub(crate)"));
     }
 
     #[test]

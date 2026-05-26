@@ -46,6 +46,7 @@ pub enum EdgeKind {
 pub enum DefinitionKind {
     Function,
     InherentMethod,
+    InherentAssociatedConstant,
     Trait,
     Struct,
     Enum,
@@ -53,6 +54,8 @@ pub enum DefinitionKind {
     TypeAlias,
     Constant,
     Static,
+    Field,
+    EnumVariant,
     Reexport,
     Module,
     Other,
@@ -186,6 +189,10 @@ pub fn analyze<'a>(
                 kind: FindingKind::DeadPublic,
                 definition,
             });
+            continue;
+        }
+
+        if definition.kind == DefinitionKind::EnumVariant {
             continue;
         }
 
@@ -452,6 +459,85 @@ mod tests {
         input[0].edges.push(Edge {
             from: "main".into(),
             to: "entry".into(),
+            kind: EdgeKind::Body,
+        });
+
+        assert!(analyze(&input, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn cross_crate_variant_use_requires_its_parent_enum_to_remain_public() {
+        let mut input = fragments(
+            vec![
+                typed_node("api_enum", "lib", true, DefinitionKind::Enum),
+                typed_node("api_enum::used", "lib", true, DefinitionKind::EnumVariant),
+            ],
+            vec![Edge {
+                from: "api_enum::used".into(),
+                to: "api_enum".into(),
+                kind: EdgeKind::Interface,
+            }],
+        );
+        input[0].edges.push(Edge {
+            from: "main".into(),
+            to: "api_enum::used".into(),
+            kind: EdgeKind::Body,
+        });
+
+        assert!(analyze(&input, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn internally_used_variant_of_required_public_enum_is_not_reported() {
+        let mut input = fragments(
+            vec![
+                typed_node("entry", "lib", true, DefinitionKind::Function),
+                typed_node("api_enum", "lib", true, DefinitionKind::Enum),
+                typed_node(
+                    "api_enum::internal",
+                    "lib",
+                    true,
+                    DefinitionKind::EnumVariant,
+                ),
+            ],
+            vec![
+                Edge {
+                    from: "entry".into(),
+                    to: "api_enum".into(),
+                    kind: EdgeKind::Interface,
+                },
+                Edge {
+                    from: "entry".into(),
+                    to: "api_enum::internal".into(),
+                    kind: EdgeKind::Body,
+                },
+            ],
+        );
+        input[0].edges.push(Edge {
+            from: "main".into(),
+            to: "entry".into(),
+            kind: EdgeKind::Body,
+        });
+
+        assert!(analyze(&input, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn cross_crate_field_use_requires_its_public_payload_type_to_remain_public() {
+        let mut input = fragments(
+            vec![
+                typed_node("api_field", "lib", true, DefinitionKind::Field),
+                typed_node("payload", "lib", true, DefinitionKind::Struct),
+            ],
+            vec![Edge {
+                from: "api_field".into(),
+                to: "payload".into(),
+                kind: EdgeKind::Interface,
+            }],
+        );
+        input[0].edges.push(Edge {
+            from: "main".into(),
+            to: "api_field".into(),
             kind: EdgeKind::Body,
         });
 
