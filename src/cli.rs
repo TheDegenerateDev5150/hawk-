@@ -12,7 +12,7 @@ use cargo_metadata::{MetadataCommand, TargetKind};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 
 use crate::config::{AnalysisTarget, Config, ConfigDiagnostic, ConfigDiagnosticKind};
-use crate::graph::{Finding, FindingKind, Fragment, Span, analyze};
+use crate::graph::{DefinitionKind, Finding, FindingKind, Fragment, Span, analyze};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -347,20 +347,54 @@ fn write_diagnostic(
     workspace_root: &Path,
     level: LintLevel,
 ) -> std::fmt::Result {
-    let (message, help) = match finding.kind {
-        FindingKind::DeadPublic => (
+    let (message, help, marker) = match (finding.kind, finding.definition.kind) {
+        (FindingKind::DeadPublic, DefinitionKind::Reexport) => (
+            format!(
+                "public re-export `{}` has no target reachable from binary `{binary}`",
+                finding.definition.name
+            ),
+            "consider restricting this re-export's visibility or removing it",
+            "public re-export",
+        ),
+        (FindingKind::DeadPublic, DefinitionKind::Module) => (
+            format!(
+                "public module `{}` has no declaration reachable from binary `{binary}`",
+                finding.definition.name
+            ),
+            "consider restricting this module's visibility or removing it",
+            "public module",
+        ),
+        (FindingKind::DeadPublic, _) => (
             format!(
                 "`{}` is public but is not reachable from binary `{binary}`",
                 finding.definition.name
             ),
             "consider restricting this declaration's visibility or removing it",
+            "public declaration",
         ),
-        FindingKind::UnnecessaryPublic => (
+        (FindingKind::UnnecessaryPublic, DefinitionKind::Reexport) => (
+            format!(
+                "public re-export `{}` is not required by any compiled cross-crate use; it can be `pub(crate)`",
+                finding.definition.name
+            ),
+            "change this re-export to `pub(crate) use`",
+            "public re-export",
+        ),
+        (FindingKind::UnnecessaryPublic, DefinitionKind::Module) => (
+            format!(
+                "public module `{}` is used only within `{}`; it can be `pub(crate)`",
+                finding.definition.name, finding.definition.crate_name
+            ),
+            "change this module to `pub(crate) mod`",
+            "public module",
+        ),
+        (FindingKind::UnnecessaryPublic, _) => (
             format!(
                 "`{}` is public but all reachable uses are within `{}`; it can be `pub(crate)`",
                 finding.definition.name, finding.definition.crate_name
             ),
             "change this declaration to `pub(crate)`",
+            "public declaration",
         ),
     };
     write_diagnostic_header(output, finding.kind.code(), message, level)?;
@@ -373,7 +407,7 @@ fn write_diagnostic(
             span.line,
             span.column,
             source_line.as_deref(),
-            "public declaration",
+            marker,
             level.style(),
         )?;
         writeln!(
