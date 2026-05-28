@@ -2,6 +2,13 @@
 
 <!-- prettier-ignore-start -->
 
+## 0.1.2
+
+Released on 2026-05-28.
+
+- Stop publishing prebuilt cargo-hawk binaries ([#65](https://github.com/astral-sh/hawk/pull/65))
+- Style Hawk front-end errors ([#67](https://github.com/astral-sh/hawk/pull/67))
+
 ## 0.1.1
 
 Released on 2026-05-28.
