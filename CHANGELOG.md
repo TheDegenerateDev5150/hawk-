@@ -2,6 +2,13 @@
 
 <!-- prettier-ignore-start -->
 
+## 0.1.1
+
+Released on 2026-05-28.
+
+- Add Rooster release preparation ([#63](https://github.com/astral-sh/hawk/pull/63))
+- Add shell installer to cargo-dist releases ([#62](https://github.com/astral-sh/hawk/pull/62))
+
 ## 0.1.0
 
 Released on 2026-05-28.
