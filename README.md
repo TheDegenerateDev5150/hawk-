@@ -46,9 +46,35 @@ unnecessarily public symbols across crates within a single workspace.
 
 ## Installation
 
-Hawk uses `rustc_private` and must be compiled against its pinned Rust
-toolchain. Prebuilt binaries are not supported. Install Rust 1.95.0 with the
-required compiler development component:
+Hawk uses `rustc_private` and must run with the exact Rust toolchain it was
+built against. Prebuilt releases are available for macOS and Linux, but they
+are not independent of Rust. Install the normal Rust 1.95.0 toolchain:
+
+```sh
+rustup toolchain install 1.95.0
+```
+
+Install the latest prebuilt release:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/astral-sh/hawk/releases/latest/download/cargo-hawk-installer.sh | sh
+```
+
+The installer places `cargo-hawk` and its internal `cargo-hawk-driver`
+executable together on your `PATH`. You can instead download the archive for
+your platform from [GitHub Releases](https://github.com/astral-sh/hawk/releases)
+and place both executables on your `PATH` in the same directory. A prebuilt
+release does not require `rustc-dev`, `RUSTC_BOOTSTRAP`, or a source build.
+
+Hawk validates the selected compiler before analysis. If a workspace selects
+another Rust version, invoke Hawk with its pinned toolchain:
+
+```sh
+cargo +1.95.0 hawk
+```
+
+To build Hawk from source, install the compiler development component:
 
 ```sh
 rustup toolchain install 1.95.0 --component rustc-dev
