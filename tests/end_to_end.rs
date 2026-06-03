@@ -131,7 +131,7 @@ fn diagnoses_public_surface_of_a_binary_product() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stdout = anstream::adapter::strip_str(&stdout).to_string();
     let summary = format!(
-        "hawk: 39 finding(s) for `app --bin app --all-features` and workspace non-production targets on target `{host_target}`\n"
+        "hawk: 42 finding(s) for `app --bin app --all-features` and workspace non-production targets on target `{host_target}`\n"
     );
     let diagnostics = stdout
         .strip_suffix(&summary)
@@ -368,6 +368,27 @@ fn diagnoses_public_surface_of_a_binary_product() {
         | ^^^ public declaration
         = help: change this declaration to `pub(crate)`
 
+    warning[hawk::unnecessary_public]: `CfgMixedProductFields::used_inside_crate` is public but all reachable uses are within `library`; it can be `pub(crate)`
+      --> library/src/lib.rs:310:5
+        |
+    310 |     pub used_inside_crate: u8,
+        |     ^^^ public declaration
+        = help: change this declaration to `pub(crate)`
+
+    warning[hawk::unnecessary_public]: `CfgAlternativeFields` is public but is needed only by tests; it can be `pub(crate)`
+      --> library/src/lib.rs:330:1
+        |
+    330 | pub struct CfgAlternativeFields {
+        | ^^^ public declaration
+        = help: change this declaration to `pub(crate)`
+
+    warning[hawk::unnecessary_public]: `CfgAlternativeFields::used_inside_crate` is public but is needed only by tests; it can be `pub(crate)`
+      --> library/src/lib.rs:331:5
+        |
+    331 |     pub used_inside_crate: u8,
+        |     ^^^ public declaration
+        = help: change this declaration to `pub(crate)`
+
     warning[hawk::unnecessary_public]: `helper` is public but is needed only by tests; it can be `pub(crate)`
       --> test_support/src/lib.rs:5:1
       |
@@ -397,17 +418,17 @@ fn diagnoses_public_surface_of_a_binary_product() {
        = help: change this declaration to `pub(crate)`
 
     warning[hawk::unknown_item]: override for `hawk::dead_public` references unknown item `library::removed_api`
-      --> hawk.toml:20:1
+      --> hawk.toml:22:1
        |
-    20 | [[override]]
+    22 | [[override]]
        | ^^^ no matching item was found
       = note: reason: covered by stale selector diagnostic
       = help: remove this override or update its `crate` and `item` selectors
 
     warning[hawk::unfulfilled_expectation]: expected `hawk::dead_public` for `library::PrivateContextOptions`, but no finding was produced
-      --> hawk.toml:27:1
+      --> hawk.toml:29:1
        |
-    27 | [[override]]
+    29 | [[override]]
        | ^^^ unfulfilled expectation
       = note: reason: covered by unfulfilled expectation diagnostic
       = help: remove this expectation or update its `lint` selector
@@ -499,7 +520,7 @@ fn ordered_lint_levels_control_severity_and_exit_status() {
     assert!(stdout.contains("warning[hawk::unnecessary_public]"));
     assert!(stdout.contains("error[hawk::unfulfilled_expectation]"));
     assert!(!stdout.contains("hawk::unknown_item"));
-    assert!(stdout.contains("hawk: 38 finding(s)"));
+    assert!(stdout.contains("hawk: 41 finding(s)"));
 }
 
 #[test]

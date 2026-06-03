@@ -290,3 +290,59 @@ pub fn test_only_helper() {}
 
 // Keep an unrelated machine-applicable rustc suggestion in the fix fixture.
 use std::fmt::Debug;
+
+pub struct UniformProductFields {
+    pub used_across_crates: u8,
+    pub used_inside_crate: u8,
+}
+
+pub fn uniform_product_fields() -> UniformProductFields {
+    let fields = UniformProductFields {
+        used_across_crates: 1,
+        used_inside_crate: 2,
+    };
+    let _ = fields.used_inside_crate;
+    fields
+}
+
+pub struct CfgMixedProductFields {
+    pub used_across_crates: u8,
+    pub used_inside_crate: u8,
+    #[cfg(any())]
+    private: u8,
+}
+
+pub fn cfg_mixed_product_fields() -> CfgMixedProductFields {
+    let fields = CfgMixedProductFields {
+        used_across_crates: 1,
+        used_inside_crate: 2,
+    };
+    let _ = fields.used_inside_crate;
+    fields
+}
+
+#[cfg(not(test))]
+pub struct CfgAlternativeFields {
+    pub used_across_crates: u8,
+}
+
+#[cfg(test)]
+pub struct CfgAlternativeFields {
+    pub used_inside_crate: u8,
+}
+
+#[cfg(not(test))]
+pub fn cfg_alternative_fields() -> CfgAlternativeFields {
+    CfgAlternativeFields {
+        used_across_crates: 1,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn exercises_cfg_alternative_field() {
+    let fields = CfgAlternativeFields {
+        used_inside_crate: 1,
+    };
+    let _ = fields.used_inside_crate;
+}
