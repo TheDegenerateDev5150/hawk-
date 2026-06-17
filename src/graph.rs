@@ -515,9 +515,13 @@ fn restricted_visibility_reduction(
     }
 
     let required_scope = merged_required_scope(definition, required_scopes, equivalents);
-    if required_scope.unknown_source
-        || required_scope.crate_name.as_deref()? != definition.crate_name
-    {
+    if required_scope.unknown_source {
+        return None;
+    }
+    let Some(required_crate) = required_scope.crate_name.as_deref() else {
+        return Some(VisibilityReduction::Private);
+    };
+    if required_crate != definition.crate_name {
         return None;
     }
     if required_scope
@@ -1241,7 +1245,7 @@ mod tests {
     fn crate_visible_helper_used_within_its_module_can_be_private() {
         let input = fragments(
             vec![
-                crate_visible_node("scoped::entry", &["scoped"]),
+                scoped_node("scoped::entry", &["scoped"]),
                 crate_visible_node("scoped::helper", &["scoped"]),
             ],
             vec![Edge {
@@ -1260,6 +1264,24 @@ mod tests {
         );
         assert_eq!(findings[0].replacement, Some(VisibilityReduction::Private));
         assert_eq!(findings[0].definition.id, "scoped::helper");
+    }
+
+    #[test]
+    fn unused_restricted_item_can_be_private() {
+        let input = fragments(
+            vec![restricted_visible_node("scoped::unused", &["scoped"])],
+            vec![],
+        );
+
+        let findings = analyze(&input, &HashSet::new());
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].kind,
+            FindingKind::UnnecessaryRestrictedVisibility
+        );
+        assert_eq!(findings[0].replacement, Some(VisibilityReduction::Private));
+        assert_eq!(findings[0].definition.id, "scoped::unused");
     }
 
     #[test]
@@ -1384,7 +1406,7 @@ mod tests {
     fn parent_visible_helper_used_within_its_module_can_be_private() {
         let input = fragments(
             vec![
-                restricted_visible_node("scoped::entry", &["scoped"]),
+                scoped_node("scoped::entry", &["scoped"]),
                 restricted_visible_node("scoped::helper", &["scoped"]),
             ],
             vec![Edge {
@@ -1409,7 +1431,7 @@ mod tests {
     fn crate_visible_helper_used_by_a_sibling_can_be_visible_to_its_parent() {
         let input = fragments(
             vec![
-                crate_visible_node("scoped::sibling::entry", &["scoped", "sibling"]),
+                scoped_node("scoped::sibling::entry", &["scoped", "sibling"]),
                 crate_visible_node("scoped::nested::helper", &["scoped", "nested"]),
             ],
             vec![Edge {
@@ -1431,7 +1453,7 @@ mod tests {
     fn crate_visible_helper_used_outside_its_parent_is_not_reported() {
         let input = fragments(
             vec![
-                crate_visible_node("outside::entry", &["outside"]),
+                scoped_node("outside::entry", &["outside"]),
                 crate_visible_node("scoped::nested::helper", &["scoped", "nested"]),
             ],
             vec![Edge {
@@ -1488,7 +1510,7 @@ mod tests {
         variant.module_scope = vec!["scoped".into(), "nested".into()];
         let input = fragments(
             vec![
-                crate_visible_node("scoped::sibling::entry", &["scoped", "sibling"]),
+                scoped_node("scoped::sibling::entry", &["scoped", "sibling"]),
                 enumeration,
                 variant,
             ],
@@ -1521,7 +1543,7 @@ mod tests {
         error.kind = DefinitionKind::Enum;
         let input = fragments(
             vec![
-                crate_visible_node("scoped::sibling::entry", &["scoped", "sibling"]),
+                scoped_node("scoped::sibling::entry", &["scoped", "sibling"]),
                 function,
                 error,
             ],
