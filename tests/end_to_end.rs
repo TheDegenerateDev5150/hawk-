@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -93,6 +93,8 @@ fn honors_cargo_configured_compiler() {
     )
     .join("bin")
     .join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    let configured_compiler = workspace.path().join("custom-compiler");
+    symlink(rustc, &configured_compiler).expect("create renamed compiler symlink");
 
     let cargo_config = workspace.path().join(".cargo");
     fs::create_dir(&cargo_config).expect("create Cargo config directory");
@@ -100,7 +102,7 @@ fn honors_cargo_configured_compiler() {
         cargo_config.join("config.toml"),
         format!(
             "[build]\nrustc = \"{}\"\n",
-            rustc
+            configured_compiler
                 .to_string_lossy()
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"")
