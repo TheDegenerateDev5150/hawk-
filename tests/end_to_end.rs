@@ -75,9 +75,14 @@ fn rejects_non_utf8_arguments_without_panicking() {
 }
 
 #[test]
-fn prints_version() {
+fn prints_version_without_overwriting_an_inherited_rustc_probe_path() {
+    let probe_dir = tempfile::tempdir().expect("temporary rustc probe directory");
+    let victim = probe_dir.path().join("rustc");
+    fs::write(&victim, "do not overwrite").expect("write probe victim");
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-hawk"))
         .args(["hawk", "--version"])
+        .env("HAWK_RUSTC_PROBE", &victim)
+        .env("HAWK_RUSTC_PROBE_TOKEN", probe_dir.path())
         .output()
         .expect("run cargo-hawk --version");
 
@@ -87,6 +92,35 @@ fn prints_version() {
         concat!("cargo hawk ", env!("CARGO_PKG_VERSION"), "\n")
     );
     assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(&victim).expect("read probe victim"),
+        "do not overwrite"
+    );
+}
+
+#[test]
+fn ignores_stale_fix_plan_during_analysis() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/basic/Cargo.toml");
+    let target_dir = tempfile::tempdir().expect("temporary target directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-hawk"))
+        .arg("--manifest-path")
+        .arg(manifest)
+        .arg("--target-dir")
+        .arg(target_dir.path())
+        .arg("-A")
+        .arg("warnings")
+        .env(
+            "HAWK_FIX_PLAN",
+            target_dir.path().join("stale-fix-plan.json"),
+        )
+        .output()
+        .expect("run cargo-hawk with a stale fix plan");
+
+    assert!(
+        output.status.success(),
+        "cargo-hawk failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(unix)]
