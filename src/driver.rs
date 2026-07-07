@@ -31,7 +31,7 @@ use rustc_span::{BytePos, FileName, Pos};
 use crate::protocol;
 use cargo_hawk_internal::graph::{
     CollectionOptions, Definition, DefinitionIdentity, DefinitionKind, Edge, EdgeKind, FindingKind,
-    FixPlan, FixTarget, Fragment, Span, VisibilityReduction,
+    FixPlan, FixTarget, Fragment, Span, TRAIT_DISPATCH_PREFIX, VisibilityReduction,
 };
 
 pub fn is_protocol_version_query(args: &[String]) -> bool {
@@ -70,6 +70,8 @@ pub fn run_wrapper(mut args: Vec<String>) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+    let experimental_trait_dispatch =
+        env::var(protocol::EXPERIMENTAL_TRAIT_DISPATCH_ENV).as_deref() == Ok("1");
     let fix_plan = match env::var_os(protocol::FIX_PLAN_ENV)
         .map(PathBuf::from)
         .map(|path| read_fix_plan(&path))
@@ -93,6 +95,7 @@ pub fn run_wrapper(mut args: Vec<String>) -> ExitCode {
         output_dir,
         root_crate,
         collection_options,
+        experimental_trait_dispatch,
         fix_plan,
     };
 
@@ -124,6 +127,7 @@ struct HawkCallbacks {
     output_dir: PathBuf,
     root_crate: String,
     collection_options: CollectionOptions,
+    experimental_trait_dispatch: bool,
     fix_plan: Option<FixPlan>,
 }
 
@@ -131,6 +135,11 @@ impl Callbacks for HawkCallbacks {
     fn config(&mut self, config: &mut interface::Config) {
         let run_id = env::var(protocol::RUN_ID_ENV).ok();
         let collection_options = self.collection_options.as_env_value();
+        let experimental_trait_dispatch = if self.experimental_trait_dispatch {
+            "1"
+        } else {
+            "0"
+        };
         config.track_state = Some(Box::new(move |session, _| {
             let mut env_depinfo = session.env_depinfo.borrow_mut();
             env_depinfo.insert((
@@ -140,6 +149,10 @@ impl Callbacks for HawkCallbacks {
             env_depinfo.insert((
                 Symbol::intern(protocol::COLLECTION_OPTIONS_ENV),
                 Some(Symbol::intern(collection_options)),
+            ));
+            env_depinfo.insert((
+                Symbol::intern(protocol::EXPERIMENTAL_TRAIT_DISPATCH_ENV),
+                Some(Symbol::intern(experimental_trait_dispatch)),
             ));
         }));
     }
@@ -155,7 +168,10 @@ impl Callbacks for HawkCallbacks {
             tcx,
             &self.root_crate,
             &self.output_dir,
-            self.collection_options,
+            FragmentOptions {
+                collection: self.collection_options,
+                experimental_trait_dispatch: self.experimental_trait_dispatch,
+            },
         ) {
             tcx.dcx()
                 .fatal(format!("hawk could not emit analysis graph: {error:#}"));
@@ -327,11 +343,17 @@ fn emit_fix(
     diagnostic.emit();
 }
 
+#[derive(Clone, Copy)]
+struct FragmentOptions {
+    collection: CollectionOptions,
+    experimental_trait_dispatch: bool,
+}
+
 fn emit_fragment(
     tcx: TyCtxt<'_>,
     root_crate: &str,
     output_dir: &Path,
-    collection_options: CollectionOptions,
+    options: FragmentOptions,
 ) -> Result<()> {
     let package_name = env::var("CARGO_PKG_NAME").context("read Cargo package name")?;
     let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
@@ -357,7 +379,7 @@ fn emit_fragment(
         crate_id,
         is_product_root,
         test_surface,
-        collection_options,
+        options,
     );
     let path = output_dir.join(format!("{crate_name}-{suffix}.json"));
     let mut file = tempfile::NamedTempFile::new_in(output_dir)
@@ -386,7 +408,7 @@ fn collect_fragment(
     crate_id: String,
     is_product_root: bool,
     test_surface: bool,
-    collection_options: CollectionOptions,
+    options: FragmentOptions,
 ) -> Fragment {
     let mut definitions = Vec::new();
     let mut defined = HashSet::new();
@@ -424,7 +446,7 @@ fn collect_fragment(
         match item.kind {
             hir::ItemKind::Struct(_, _, data) | hir::ItemKind::Union(_, _, data) => {
                 let uniform_field_group = uniform_field_group(
-                    collection_options,
+                    options.collection,
                     || source_fields_have_uniform_visibility(tcx, item.span),
                     || span(tcx, item.owner_id.def_id),
                 );
@@ -491,6 +513,7 @@ fn collect_fragment(
             EdgeKind::Body,
             Some(tcx.typeck_body(body.id())),
             true,
+            options.experimental_trait_dispatch,
         );
         visitor.visit_body(body);
         visitor.finish(&mut edges);
@@ -508,6 +531,7 @@ fn collect_fragment(
             },
             None,
             false,
+            options.experimental_trait_dispatch,
         );
         visitor.visit_node(tcx.hir_node_by_def_id(def_id));
         visitor.finish(&mut edges);
@@ -572,6 +596,7 @@ fn collect_fragment(
                 EdgeKind::Interface,
                 None,
                 false,
+                options.experimental_trait_dispatch,
             );
             visitor.visit_field_def(field);
             visitor.finish(&mut edges);
@@ -613,6 +638,17 @@ fn collect_fragment(
                 kind: EdgeKind::VisibilityRequirement,
             })
     }));
+    if options.experimental_trait_dispatch {
+        // Trait-defining crates cannot see downstream implementations. A synthetic
+        // identity lets every compiled impl contribute to the merged dispatch fan-out.
+        edges.extend(tcx.hir_body_owners().filter_map(|def_id| {
+            Some(Edge {
+                from: trait_dispatch_id(tcx, def_id.to_def_id())?,
+                to: id(tcx, def_id.to_def_id()),
+                kind: EdgeKind::Body,
+            })
+        }));
+    }
 
     edges.sort_by(|left, right| {
         (&left.from, &left.to, left.kind as u8).cmp(&(&right.from, &right.to, right.kind as u8))
@@ -724,6 +760,11 @@ fn collect_fragment(
                 DefKind::Trait | DefKind::Impl { of_trait: true }
             )
         })
+        .filter(|def_id| {
+            !options.experimental_trait_dispatch
+                || is_lang_item_trait_impl_body(tcx, *def_id)
+                || !is_private_local_trait_body(tcx, *def_id)
+        })
         .map(|def_id| id(tcx, def_id.to_def_id()))
         .chain(
             definitions
@@ -764,6 +805,30 @@ fn collect_fragment(
         conservative_roots,
         required_public_roots,
     }
+}
+
+fn is_lang_item_trait_impl_body(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+    let impl_def_id = tcx.local_parent(def_id);
+    matches!(tcx.def_kind(impl_def_id), DefKind::Impl { of_trait: true })
+        && (tcx
+            .lang_items()
+            .from_def_id(tcx.impl_trait_id(impl_def_id))
+            .is_some()
+            || tcx
+                .trait_item_of(def_id.to_def_id())
+                .is_some_and(|trait_item| tcx.lang_items().from_def_id(trait_item).is_some()))
+}
+
+fn is_private_local_trait_body(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+    // Uninstrumented dependencies cannot name a trait that is both local and
+    // effectively private, so every possible dispatch site is in this fragment.
+    let Some(trait_def_id) = trait_item(tcx, def_id.to_def_id())
+        .and_then(|trait_item| tcx.trait_of_assoc(trait_item))
+        .and_then(DefId::as_local)
+    else {
+        return false;
+    };
+    !tcx.effective_visibilities(()).is_exported(trait_def_id)
 }
 
 fn is_public_candidate(tcx: TyCtxt<'_>, def_id: LocalDefId, test_surface: bool) -> bool {
@@ -1071,6 +1136,17 @@ fn normalize_source_path(path: String) -> String {
     normalized.to_string_lossy().into_owned()
 }
 
+fn trait_item(tcx: TyCtxt<'_>, def_id: DefId) -> Option<DefId> {
+    tcx.trait_of_assoc(def_id)
+        .map(|_| def_id)
+        .or_else(|| tcx.trait_item_of(def_id))
+}
+
+fn trait_dispatch_id(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
+    trait_item(tcx, def_id)
+        .map(|trait_item| format!("{TRAIT_DISPATCH_PREFIX}{}", id(tcx, trait_item)))
+}
+
 struct ReferenceVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     source: DefId,
@@ -1078,6 +1154,8 @@ struct ReferenceVisitor<'tcx> {
     typeck_results: Option<&'tcx ty::TypeckResults<'tcx>>,
     traverse_bodies: bool,
     targets: HashSet<DefId>,
+    trait_dispatch_targets: HashSet<String>,
+    experimental_trait_dispatch: bool,
 }
 
 impl<'tcx> ReferenceVisitor<'tcx> {
@@ -1087,6 +1165,7 @@ impl<'tcx> ReferenceVisitor<'tcx> {
         edge_kind: EdgeKind,
         typeck_results: Option<&'tcx ty::TypeckResults<'tcx>>,
         traverse_bodies: bool,
+        experimental_trait_dispatch: bool,
     ) -> Self {
         Self {
             tcx,
@@ -1095,18 +1174,25 @@ impl<'tcx> ReferenceVisitor<'tcx> {
             typeck_results,
             traverse_bodies,
             targets: HashSet::new(),
+            trait_dispatch_targets: HashSet::new(),
+            experimental_trait_dispatch,
         }
     }
 
     fn finish(self, edges: &mut Vec<Edge>) {
-        if self.targets.is_empty() {
+        if self.targets.is_empty() && self.trait_dispatch_targets.is_empty() {
             return;
         }
         let source = id(self.tcx, self.source);
-        edges.reserve(self.targets.len());
+        edges.reserve(self.targets.len() + self.trait_dispatch_targets.len());
         edges.extend(self.targets.into_iter().map(|target| Edge {
             from: source.clone(),
             to: id(self.tcx, target),
+            kind: self.edge_kind,
+        }));
+        edges.extend(self.trait_dispatch_targets.into_iter().map(|target| Edge {
+            from: source.clone(),
+            to: target,
             kind: self.edge_kind,
         }));
     }
@@ -1139,6 +1225,58 @@ impl<'tcx> ReferenceVisitor<'tcx> {
         self.targets.insert(def_id);
     }
 
+    fn record_resolution(&mut self, resolution: Res, hir_id: hir::HirId) {
+        if self.experimental_trait_dispatch
+            && let Res::Def(DefKind::AssocFn | DefKind::AssocConst { .. }, def_id) = resolution
+            && let Some(typeck_results) = self.typeck_results
+        {
+            if let Some(args) = typeck_results.node_args_opt(hir_id) {
+                self.record_callable(def_id, args);
+            } else {
+                self.record_def(def_id);
+                self.record_trait_dispatch(def_id);
+            }
+        } else {
+            self.record(resolution);
+        }
+    }
+
+    fn record_callable(&mut self, def_id: DefId, args: ty::GenericArgsRef<'tcx>) {
+        self.record_def(def_id);
+        let Some(dispatch_id) = trait_dispatch_id(self.tcx, def_id) else {
+            return;
+        };
+        let typeck_results = self
+            .typeck_results
+            .expect("callable references are collected from a typed body");
+        let typing_env = ty::TypingEnv::post_analysis(self.tcx, typeck_results.hir_owner.def_id);
+        // A virtual, reified, or still-generic reference can select any impl that
+        // contributes an edge to this trait item's synthetic dispatch identity.
+        match ty::Instance::try_resolve(self.tcx, typing_env, def_id, args) {
+            Ok(Some(instance))
+                if !matches!(
+                    instance.def,
+                    ty::InstanceKind::Virtual(..) | ty::InstanceKind::ReifyShim(..)
+                ) =>
+            {
+                self.record_def(instance.def_id());
+            }
+            Ok(Some(_)) | Ok(None) | Err(_) => {
+                self.record_trait_dispatch_id(dispatch_id);
+            }
+        }
+    }
+
+    fn record_trait_dispatch(&mut self, def_id: DefId) {
+        if let Some(dispatch_id) = trait_dispatch_id(self.tcx, def_id) {
+            self.record_trait_dispatch_id(dispatch_id);
+        }
+    }
+
+    fn record_trait_dispatch_id(&mut self, dispatch_id: String) {
+        self.trait_dispatch_targets.insert(dispatch_id);
+    }
+
     fn record_non_enum_field(&mut self, adt: ty::AdtDef<'tcx>, hir_id: hir::HirId) {
         if let Some(typeck_results) = self.typeck_results
             && let Some(index) = typeck_results.opt_field_index(hir_id)
@@ -1169,21 +1307,33 @@ impl<'tcx> Visitor<'tcx> for ReferenceVisitor<'tcx> {
     }
 
     fn visit_path(&mut self, path: &hir::Path<'tcx>, hir_id: hir::HirId) {
-        self.record(path.res);
+        self.record_resolution(path.res, hir_id);
         intravisit::walk_path(self, path);
-        let _ = hir_id;
     }
 
     fn visit_expr(&mut self, expression: &'tcx hir::Expr<'tcx>) {
         if let Some(typeck_results) = self.typeck_results {
+            if self.experimental_trait_dispatch
+                && let Some(def_id) = typeck_results.type_dependent_def_id(expression.hir_id)
+            {
+                if let Some(args) = typeck_results.node_args_opt(expression.hir_id) {
+                    self.record_callable(def_id, args);
+                } else {
+                    self.record_def(def_id);
+                    self.record_trait_dispatch(def_id);
+                }
+            }
             match expression.kind {
                 hir::ExprKind::Path(ref qpath @ hir::QPath::TypeRelative(..)) => {
-                    self.record(typeck_results.qpath_res(qpath, expression.hir_id));
+                    self.record_resolution(
+                        typeck_results.qpath_res(qpath, expression.hir_id),
+                        expression.hir_id,
+                    );
                 }
                 hir::ExprKind::Struct(qpath, fields, tail) => {
                     let resolution = typeck_results.qpath_res(qpath, expression.hir_id);
                     if matches!(qpath, hir::QPath::TypeRelative(..)) {
-                        self.record(resolution);
+                        self.record_resolution(resolution, expression.hir_id);
                     }
                     if let Some(adt) = typeck_results.expr_ty(expression).ty_adt_def()
                         && !adt.is_enum()
@@ -1216,7 +1366,7 @@ impl<'tcx> Visitor<'tcx> for ReferenceVisitor<'tcx> {
                         }
                     }
                 }
-                hir::ExprKind::MethodCall(..) => {
+                hir::ExprKind::MethodCall(..) if !self.experimental_trait_dispatch => {
                     if let Some(def_id) = typeck_results.type_dependent_def_id(expression.hir_id) {
                         self.record_def(def_id);
                     }
