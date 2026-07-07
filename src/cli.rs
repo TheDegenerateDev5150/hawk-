@@ -1,11 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::DefaultHasher};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter, Write as _};
 use std::fs::{self, File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use anstyle::{AnsiColor, Style};
 use anyhow::{Context, Result, bail};
@@ -247,9 +248,20 @@ impl From<TerminalColor> for anstream::ColorChoice {
     }
 }
 
+impl TerminalColor {
+    fn cargo_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+}
+
 struct RustToolchain {
     rustc: OsString,
     sysroot: PathBuf,
+    host: String,
 }
 
 impl RustToolchain {
@@ -316,11 +328,19 @@ impl RustToolchain {
             );
         }
 
-        Ok(Self { rustc, sysroot })
+        Ok(Self {
+            rustc,
+            sysroot,
+            host: host.to_owned(),
+        })
     }
 
     fn rustc(&self) -> &OsStr {
         &self.rustc
+    }
+
+    fn host(&self) -> &str {
+        &self.host
     }
 
     fn configure_command(&self, command: &mut Command) -> Result<()> {
@@ -597,10 +617,14 @@ pub fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         .manifest_path
         .canonicalize()
         .with_context(|| format!("resolve manifest path for {}", args.manifest_path.display()))?;
-    let toolchain = RustToolchain::discover(&workspace_root, &manifest_path)?;
     let config = Config::load(&workspace_root, args.config.as_deref())?;
-    let analysis_target =
-        AnalysisTarget::from_rustc(args.target.as_deref(), toolchain.rustc(), &workspace_root)?;
+    let toolchain = RustToolchain::discover(&workspace_root, &manifest_path)?;
+    let analysis_target = AnalysisTarget::from_rustc(
+        args.target.as_deref(),
+        toolchain.host(),
+        toolchain.rustc(),
+        &workspace_root,
+    )?;
     let mut production_products: Vec<ProductionSelection<'_>> = Vec::new();
     for consumer in config.production_consumers(&analysis_target) {
         let config_path = config
@@ -709,6 +733,7 @@ pub fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
     let excluded: HashSet<String> = args.excluded_crates.iter().cloned().collect();
     if args.fix {
         let mut fix_iteration = 0;
+        let mut applied_fix_plans = HashSet::new();
         loop {
             let initial_findings = config.apply(
                 &analysis_target,
@@ -762,6 +787,15 @@ pub fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
                 fix_plan_for(fixable_findings.iter().copied(), &production_definitions);
             let test_emission_plan =
                 fix_plan_for(fixable_findings.iter().copied(), &test_definitions);
+            if production_fix_plan.targets.is_empty() && test_fix_plan.targets.is_empty() {
+                break;
+            }
+            let fix_signature = fix_plan_signature(&production_fix_plan, &test_fix_plan)?;
+            if !applied_fix_plans.insert(fix_signature) {
+                bail!(
+                    "visibility fixes made no progress after {fix_iteration} iteration(s); the same fix plan was produced after re-analysis"
+                );
+            }
             let mut applied_fixes = false;
             if !test_fix_plan.targets.is_empty() {
                 let fix_packages = fix_packages(&metadata, &test_fix_plan)?;
@@ -793,13 +827,11 @@ pub fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
                 )?;
                 applied_fixes = true;
             }
-            if !applied_fixes {
-                break;
-            }
+            debug_assert!(
+                applied_fixes,
+                "a non-empty fix plan applies at least one mode"
+            );
             fix_iteration += 1;
-            if fix_iteration > 3 {
-                bail!("visibility fixes did not converge after {fix_iteration} iterations");
-            }
             clear_fragments(&production_graph_dir)?;
             clear_fragments(&non_production_graph_dir)?;
             let fragments = cargo.collect_fragments(
@@ -1072,7 +1104,9 @@ impl InstrumentedCargo<'_> {
             .arg("--locked")
             .arg("--target-dir")
             .arg(self.target_dir)
-            .args(selection_arguments);
+            .args(selection_arguments)
+            .arg("--color")
+            .arg(self.args.color.cargo_value());
         self.toolchain.configure_command(&mut command)?;
         if let Some(target) = &self.args.target {
             command.arg("--target").arg(target);
@@ -1098,6 +1132,8 @@ impl InstrumentedCargo<'_> {
             .env(protocol::RUN_ID_ENV, run_id);
         if doctests {
             command
+                .arg("--quiet")
+                .stdout(Stdio::null())
                 .env("RUSTC_BOOTSTRAP", "1")
                 .env(
                     "CARGO_ENCODED_RUSTDOCFLAGS",
@@ -1227,6 +1263,27 @@ fn definition_index(fragments: &[Fragment]) -> DefinitionIndex<'_> {
             .push(definition);
     }
     definitions
+}
+
+fn fix_plan_signature(production: &FixPlan, non_production: &FixPlan) -> Result<Vec<Vec<u8>>> {
+    let mut signature = Vec::with_capacity(production.targets.len() + non_production.targets.len());
+    for (mode, plan) in [(b'p', production), (b'n', non_production)] {
+        for target in &plan.targets {
+            let encoded = serde_json::to_vec(&(
+                mode,
+                &target.crate_name,
+                &target.name,
+                target.definition_kind,
+                &target.span,
+                target.kind,
+                target.replacement,
+            ))
+            .context("serialize fix plan signature")?;
+            signature.push(encoded);
+        }
+    }
+    signature.sort_unstable();
+    Ok(signature)
 }
 
 fn fix_plan_for<'a>(
@@ -1815,20 +1872,35 @@ fn validate_product(
     Ok(())
 }
 
+// Stay below the 255-byte/code-unit component limits of supported filesystems
+// while leaving the ordinary workspace name readable.
+const DEFAULT_TARGET_DIR_COMPONENT_MAX_BYTES: usize = 240;
+
 fn default_target_dir(workspace_root: &Path) -> PathBuf {
     let workspace = workspace_root
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("workspace");
+    let mut hasher = DefaultHasher::new();
+    workspace_root.hash(&mut hasher);
+    let suffix = format!("-{:016x}", hasher.finish());
+    let max_workspace_bytes = DEFAULT_TARGET_DIR_COMPONENT_MAX_BYTES - suffix.len();
+    let mut workspace_end = workspace.len().min(max_workspace_bytes);
+    while !workspace.is_char_boundary(workspace_end) {
+        workspace_end -= 1;
+    }
+    let workspace = format!("{}{suffix}", &workspace[..workspace_end]);
     env::temp_dir().join("cargo-hawk-target").join(workspace)
 }
 
 fn read_fragments(graph_dir: &Path) -> Result<Vec<Fragment>> {
-    let mut fragments = Vec::new();
-    for entry in fs::read_dir(graph_dir)
+    let mut paths = fs::read_dir(graph_dir)
         .with_context(|| format!("read graph directory {}", graph_dir.display()))?
-    {
-        let path = entry?.path();
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort_unstable();
+    let mut fragments = Vec::new();
+    for path in paths {
         if path
             .extension()
             .is_some_and(|extension| extension == "json")
@@ -1864,16 +1936,20 @@ fn clear_fragments(graph_dir: &Path) -> Result<()> {
 mod tests {
     use std::cell::Cell;
     use std::ffi::OsString;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use clap::CommandFactory;
 
     use crate::config::ConfigDiagnosticKind;
-    use crate::graph::{Definition, DefinitionKind, Finding, FindingKind, Span};
+    use crate::graph::{
+        Definition, DefinitionKind, Finding, FindingKind, FixPlan, FixTarget, Span,
+        VisibilityReduction,
+    };
 
     use super::{
-        Args, CargoInvocation, ConsumerMode, DiagnosticRenderer, LintLevel, LintLevels,
-        ProductionSelection, default_target_dir,
+        Args, CargoInvocation, ConsumerMode, DEFAULT_TARGET_DIR_COMPONENT_MAX_BYTES,
+        DiagnosticRenderer, LintLevel, LintLevels, ProductionSelection, default_target_dir,
+        fix_plan_signature,
     };
 
     fn render_diagnostic(finding: &Finding<'_>) -> String {
@@ -1914,12 +1990,108 @@ mod tests {
     #[test]
     fn default_target_dir_uses_platform_temp_directory() {
         let workspace_root = Path::new("/path/to/example-workspace");
+        let target_dir = default_target_dir(workspace_root);
 
         assert_eq!(
-            default_target_dir(workspace_root),
-            std::env::temp_dir()
-                .join("cargo-hawk-target")
-                .join("example-workspace")
+            target_dir.parent(),
+            Some(std::env::temp_dir().join("cargo-hawk-target").as_path())
+        );
+        assert!(
+            target_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("example-workspace-"))
+        );
+        assert_ne!(
+            target_dir,
+            default_target_dir(Path::new("/another/path/to/example-workspace"))
+        );
+    }
+
+    #[test]
+    fn default_target_dir_truncates_long_workspace_names() {
+        let workspace = "a".repeat(245);
+        let workspace_root = PathBuf::from("/path/to").join(&workspace);
+        let other_workspace_root = PathBuf::from("/another/path/to").join(&workspace);
+        let target_dir = default_target_dir(&workspace_root);
+        let other_target_dir = default_target_dir(&other_workspace_root);
+        let component = target_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 target directory component");
+        let other_component = other_target_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 target directory component");
+
+        assert_eq!(component.len(), DEFAULT_TARGET_DIR_COMPONENT_MAX_BYTES);
+        let (workspace, suffix) = component
+            .rsplit_once('-')
+            .expect("target directory has a hash suffix");
+        assert_eq!(
+            workspace,
+            "a".repeat(DEFAULT_TARGET_DIR_COMPONENT_MAX_BYTES - suffix.len() - 1)
+        );
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(component, other_component);
+    }
+
+    #[test]
+    fn default_target_dir_truncates_at_a_utf8_boundary() {
+        let workspace_root = PathBuf::from("/path/to").join("é".repeat(123));
+        let target_dir = default_target_dir(&workspace_root);
+        let component = target_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 target directory component");
+        let (workspace, suffix) = component
+            .rsplit_once('-')
+            .expect("target directory has a hash suffix");
+
+        assert!(component.len() <= DEFAULT_TARGET_DIR_COMPONENT_MAX_BYTES);
+        assert!(!workspace.is_empty());
+        assert!(workspace.chars().all(|character| character == 'é'));
+        assert_eq!(suffix.len(), 16);
+    }
+
+    #[test]
+    fn fix_plan_signatures_are_independent_of_target_order() {
+        let target = |id: &str, name: &str| FixTarget {
+            id: id.into(),
+            crate_name: "library".into(),
+            name: name.into(),
+            definition_kind: DefinitionKind::Function,
+            span: None,
+            kind: FindingKind::UnnecessaryPublic,
+            replacement: VisibilityReduction::Crate,
+        };
+        let forward = FixPlan {
+            protocol_version: crate::protocol::ProtocolVersion,
+            targets: vec![
+                target("before-first", "first"),
+                target("before-second", "second"),
+            ],
+        };
+        let reverse = FixPlan {
+            protocol_version: crate::protocol::ProtocolVersion,
+            targets: vec![
+                target("after-second", "second"),
+                target("after-first", "first"),
+            ],
+        };
+        let empty = FixPlan {
+            protocol_version: crate::protocol::ProtocolVersion,
+            targets: vec![],
+        };
+
+        assert_eq!(
+            fix_plan_signature(&forward, &empty).expect("serialize forward fix plan"),
+            fix_plan_signature(&reverse, &empty).expect("serialize reverse fix plan")
+        );
+        assert_ne!(
+            fix_plan_signature(&forward, &empty).expect("serialize production fix plan"),
+            fix_plan_signature(&empty, &forward).expect("serialize non-production fix plan")
         );
     }
 
