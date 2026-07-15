@@ -214,19 +214,21 @@ fn emit_fixes(tcx: TyCtxt<'_>, fix_plan: &FixPlan) {
         }
     }
 
-    let unfixable_spans: HashSet<_> = visibility_fixes
-        .iter()
-        .filter_map(|(span, kind)| kind.is_none().then_some(*span))
-        .collect();
-    let mut emitted_spans = HashSet::new();
-    for (span, kind) in &visibility_fixes {
-        let Some(kind) = kind else {
-            continue;
-        };
-        if unfixable_spans.contains(span) || !emitted_spans.insert(*span) {
-            continue;
+    let mut grouped_fixes = HashMap::new();
+    for (span, kind) in visibility_fixes {
+        grouped_fixes
+            .entry((source_span(tcx, span), span.hi() - span.lo()))
+            .and_modify(|(_, planned)| {
+                if *planned != kind {
+                    *planned = None;
+                }
+            })
+            .or_insert((span, kind));
+    }
+    for (_, (span, kind)) in grouped_fixes {
+        if let Some(kind) = kind {
+            emit_fix(tcx, span, kind);
         }
-        emit_fix(tcx, *span, *kind);
     }
 }
 
@@ -417,7 +419,7 @@ fn collect_fragment(
             &crate_name,
             kind.unwrap_or(DefinitionKind::Other),
             public_api,
-            visibility,
+            visibility.as_deref(),
         ));
         defined.insert(def_id);
     }
@@ -463,7 +465,7 @@ fn collect_fragment(
                         &crate_name,
                         DefinitionKind::Field,
                         public_api,
-                        visibility,
+                        visibility.as_deref(),
                     );
                     field_definition
                         .uniform_field_group
@@ -481,7 +483,7 @@ fn collect_fragment(
                         &crate_name,
                         DefinitionKind::EnumVariant,
                         is_public_variant(tcx, variant.def_id, test_surface),
-                        visibility_modifier(tcx, variant.def_id),
+                        visibility_modifier(tcx, variant.def_id).as_deref(),
                     ));
                     defined.insert(variant.def_id);
                     adt_members.push((variant.def_id, item.owner_id.def_id));
@@ -499,7 +501,7 @@ fn collect_fragment(
                 &crate_name,
                 DefinitionKind::Other,
                 false,
-                visibility_modifier(tcx, def_id),
+                visibility_modifier(tcx, def_id).as_deref(),
             ));
         }
     }
@@ -966,11 +968,10 @@ fn definition(
     crate_name: &str,
     kind: DefinitionKind,
     public_api: bool,
-    visibility: Option<String>,
+    visibility: Option<&str>,
 ) -> Definition {
-    let has_explicit_visibility = visibility
-        .as_deref()
-        .is_some_and(|visibility| visibility.starts_with("pub"));
+    let has_explicit_visibility =
+        visibility.is_some_and(|visibility| visibility.starts_with("pub"));
     let restricted_visibility = (kind != DefinitionKind::Reexport
         && !tcx.def_span(def_id).from_expansion()
         && has_explicit_visibility)
@@ -986,7 +987,7 @@ fn definition(
         public_api,
         restricted_visible_api,
         crate_visible_api: restricted_visible_api
-            && visibility.as_deref() == Some("pub(crate)")
+            && visibility == Some("pub(crate)")
             && restricted_visibility == Some(ty::Visibility::Restricted(CRATE_DEF_ID)),
         visible_reexport_api: kind == DefinitionKind::Reexport && has_explicit_visibility,
         module_scope: module_scope(tcx, def_id),
@@ -1079,8 +1080,12 @@ fn span(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<Span> {
     if span.from_expansion() {
         return None;
     }
+    Some(source_span(tcx, span))
+}
+
+fn source_span(tcx: TyCtxt<'_>, span: rustc_span::Span) -> Span {
     let location = tcx.sess.source_map().lookup_char_pos(span.lo());
-    Some(Span {
+    Span {
         file: normalize_source_path(
             &location
                 .file
@@ -1090,7 +1095,7 @@ fn span(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<Span> {
         ),
         line: location.line,
         column: location.col.to_usize() + 1,
-    })
+    }
 }
 
 fn normalize_source_path(path: &str) -> String {
