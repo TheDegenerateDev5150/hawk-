@@ -1426,7 +1426,7 @@ fn fix_plan_for<'a>(
                     .into_iter()
                     .flatten()
                     .map(move |definition| FixTarget {
-                        id: definition.id.clone(),
+                        id: definition.id,
                         crate_name: definition.crate_name.clone(),
                         name: definition.name.clone(),
                         definition_kind: definition.kind,
@@ -2069,9 +2069,16 @@ mod tests {
     use crate::config::ConfigDiagnosticKind;
     use crate::protocol::ConsumerMode;
     use cargo_hawk_internal::graph::{
-        Definition, DefinitionKind, Finding, FindingKind, FixPlan, FixTarget, Span,
+        Definition, DefinitionId, DefinitionKind, Finding, FindingKind, FixPlan, FixTarget, Span,
         VisibilityReduction,
     };
+
+    fn test_id(value: &str) -> DefinitionId {
+        let hash = value.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        DefinitionId::new(0, hash)
+    }
 
     use super::{
         Args, CargoInvocation, DEFAULT_TARGET_DIR_COMPONENT_MAX_BYTES, DiagnosticRenderer,
@@ -2184,7 +2191,7 @@ mod tests {
     #[test]
     fn fix_plan_signatures_are_independent_of_target_order() {
         let target = |id: &str, name: &str| FixTarget {
-            id: id.into(),
+            id: test_id(id),
             crate_name: "library".into(),
             name: name.into(),
             definition_kind: DefinitionKind::Function,
@@ -2327,7 +2334,7 @@ mod tests {
     #[test]
     fn diagnostic_rendering_includes_terminal_styles() {
         let definition = Definition {
-            id: "internal_helper".into(),
+            id: test_id("internal_helper"),
             crate_name: "library".into(),
             name: "internal_helper".into(),
             kind: DefinitionKind::Function,
@@ -2368,7 +2375,7 @@ mod tests {
     #[test]
     fn crate_visibility_diagnostic_names_the_required_scope() {
         let definition = Definition {
-            id: "scoped::run".into(),
+            id: test_id("scoped::run"),
             crate_name: "library".into(),
             name: "scoped::run".into(),
             kind: DefinitionKind::Function,
@@ -2408,7 +2415,7 @@ mod tests {
     #[test]
     fn restricted_visibility_diagnostic_removes_the_modifier() {
         let definition = Definition {
-            id: "scoped::private_parent_visible_helper".into(),
+            id: test_id("scoped::private_parent_visible_helper"),
             crate_name: "library".into(),
             name: "scoped::private_parent_visible_helper".into(),
             kind: DefinitionKind::Function,
@@ -2448,7 +2455,7 @@ mod tests {
     #[test]
     fn dead_enum_variant_diagnostic_accounts_for_unreachable_uses() {
         let definition = Definition {
-            id: "InternalState::Active".into(),
+            id: test_id("InternalState::Active"),
             crate_name: "library".into(),
             name: "InternalState::Active".into(),
             kind: DefinitionKind::EnumVariant,

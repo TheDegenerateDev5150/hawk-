@@ -30,8 +30,8 @@ use rustc_span::{BytePos, FileName, Pos};
 
 use crate::protocol;
 use cargo_hawk_internal::graph::{
-    CollectionOptions, Definition, DefinitionIdentity, DefinitionKind, Edge, EdgeKind,
-    ExpansionSpan, FindingKind, FixPlan, FixTarget, Fragment, Span, VisibilityReduction,
+    CollectionOptions, Definition, DefinitionId, DefinitionIdentity, DefinitionKind, Edge,
+    EdgeKind, ExpansionSpan, FindingKind, FixPlan, FixTarget, Fragment, Span, VisibilityReduction,
 };
 
 pub(crate) fn is_protocol_version_query(args: &[String]) -> bool {
@@ -274,7 +274,7 @@ fn emit_fixes(tcx: TyCtxt<'_>, fix_plan: &FixPlan) {
 }
 
 struct FixPlanIndex<'a> {
-    by_id: HashMap<&'a str, &'a FixTarget>,
+    by_id: HashMap<DefinitionId, &'a FixTarget>,
     by_identity: HashMap<DefinitionIdentity<'a>, &'a FixTarget>,
 }
 
@@ -284,7 +284,7 @@ impl<'a> FixPlanIndex<'a> {
             by_id: fix_plan
                 .targets
                 .iter()
-                .map(|target| (target.id.as_str(), target))
+                .map(|target| (target.id, target))
                 .collect(),
             by_identity: fix_plan
                 .targets
@@ -304,8 +304,8 @@ impl<'a> FixPlanIndex<'a> {
         }
     }
 
-    fn get_by_id(&self, id: &str) -> Option<&'a FixTarget> {
-        self.by_id.get(id).copied()
+    fn get_by_id(&self, id: DefinitionId) -> Option<&'a FixTarget> {
+        self.by_id.get(&id).copied()
     }
 
     fn get_by_identity(&self, identity: &DefinitionIdentity<'_>) -> Option<&'a FixTarget> {
@@ -320,7 +320,7 @@ fn planned_fix(
     fix_plan: &FixPlanIndex<'_>,
 ) -> Option<(FindingKind, VisibilityReduction)> {
     let id = id(tcx, def_id.to_def_id());
-    if let Some(target) = fix_plan.get_by_id(&id) {
+    if let Some(target) = fix_plan.get_by_id(id) {
         return Some((target.kind, target.replacement));
     }
 
@@ -386,10 +386,7 @@ fn emit_fragment(
     } else {
         crate_name == root_crate && tcx.entry_fn(()).is_some()
     };
-    let suffix: String = crate_id
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect();
+    let suffix = crate_id.to_string();
     let fragment = collect_fragment(
         tcx,
         package_name,
@@ -423,7 +420,7 @@ fn collect_fragment(
     tcx: TyCtxt<'_>,
     package_name: String,
     crate_name: String,
-    crate_id: String,
+    crate_id: DefinitionId,
     is_product_root: bool,
     test_surface: bool,
     collection_options: CollectionOptions,
@@ -583,10 +580,10 @@ fn collect_fragment(
             let exposed_types: Vec<_> = edges[edge_start..]
                 .iter()
                 .filter(|edge| edge.kind == EdgeKind::Interface)
-                .map(|edge| edge.to.clone())
+                .map(|edge| edge.to)
                 .collect();
             edges.extend(exposed_types.into_iter().map(|target| Edge {
-                from: trait_id.clone(),
+                from: trait_id,
                 to: target,
                 kind: EdgeKind::VisibilityRequirement,
             }));
@@ -684,7 +681,7 @@ fn collect_fragment(
     // Lowering a type exposed by a public trait impl can fail privacy checking
     // even when the selected product does not otherwise reference that type.
     // This includes concrete types exposed by refined `impl Trait` methods.
-    let trait_impl_interface_sources: HashSet<String> = crate_items
+    let trait_impl_interface_sources: HashSet<DefinitionId> = crate_items
         .impl_items()
         .map(|item| item.owner_id.def_id)
         .filter(|def_id| {
@@ -699,18 +696,18 @@ fn collect_fragment(
         .collect();
     // Type aliases are transparent for privacy: preserve their exposed target
     // types, but do not suppress a visibility finding for the alias itself.
-    let type_aliases: HashSet<&str> = definitions
+    let type_aliases: HashSet<DefinitionId> = definitions
         .iter()
         .filter(|definition| definition.kind == DefinitionKind::TypeAlias)
-        .map(|definition| definition.id.as_str())
+        .map(|definition| definition.id)
         .collect();
     let interface_targets = type_alias_interface_targets(&edges, &type_aliases);
-    let mut pending_required_public_roots: Vec<&str> = edges
+    let mut pending_required_public_roots: Vec<DefinitionId> = edges
         .iter()
         .filter(|edge| {
             edge.kind == EdgeKind::Interface && trait_impl_interface_sources.contains(&edge.from)
         })
-        .map(|edge| edge.to.as_str())
+        .map(|edge| edge.to)
         .collect();
     let mut required_public_roots = Vec::new();
     let mut examined_required_public_roots = HashSet::new();
@@ -718,16 +715,21 @@ fn collect_fragment(
         if !examined_required_public_roots.insert(target) {
             continue;
         }
-        if type_aliases.contains(target) {
-            pending_required_public_roots
-                .extend(interface_targets.get(target).into_iter().flatten().copied());
+        if type_aliases.contains(&target) {
+            pending_required_public_roots.extend(
+                interface_targets
+                    .get(&target)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
         } else {
-            required_public_roots.push(target.to_owned());
+            required_public_roots.push(target);
         }
     }
     // Lowering the local target of a public reexport fails with E0365 while
     // the reexport remains part of the crate interface.
-    let public_reexport_sources: HashSet<String> = public_reexports
+    let public_reexport_sources: HashSet<DefinitionId> = public_reexports
         .iter()
         .map(|def_id| id(tcx, def_id.to_def_id()))
         .collect();
@@ -737,7 +739,7 @@ fn collect_fragment(
             .filter(|edge| {
                 edge.kind == EdgeKind::Reexport && public_reexport_sources.contains(&edge.from)
             })
-            .map(|edge| edge.to.clone()),
+            .map(|edge| edge.to),
     );
     // Consumer paths through a public reexport are erased to its declaration
     // target in HIR. A containing namespace cannot be narrowed soundly until
@@ -754,7 +756,7 @@ fn collect_fragment(
             definitions
                 .iter()
                 .filter(|definition| definition.public_api)
-                .map(|definition| definition.id.clone()),
+                .map(|definition| definition.id),
         );
     }
     required_public_roots.sort();
@@ -764,7 +766,7 @@ fn collect_fragment(
         .filter(|_| is_product_root)
         .map(|(def_id, _)| vec![id(tcx, def_id)])
         .unwrap_or_default();
-    let mut conservative_roots: Vec<String> = tcx
+    let mut conservative_roots: Vec<DefinitionId> = tcx
         .hir_body_owners()
         .filter(|def_id| {
             matches!(
@@ -780,7 +782,7 @@ fn collect_fragment(
             definitions
                 .iter()
                 .filter(|definition| definition.dead_code_allowed)
-                .map(|definition| definition.id.clone()),
+                .map(|definition| definition.id),
         )
         .collect();
     conservative_roots.extend(
@@ -972,20 +974,20 @@ fn source_item_at_or_after<T>(
     (*file_start == source_file).then_some(item)
 }
 
-fn type_alias_interface_targets<'a>(
-    edges: &'a [Edge],
-    type_aliases: &HashSet<&str>,
-) -> HashMap<&'a str, Vec<&'a str>> {
+fn type_alias_interface_targets(
+    edges: &[Edge],
+    type_aliases: &HashSet<DefinitionId>,
+) -> HashMap<DefinitionId, Vec<DefinitionId>> {
     let mut targets = HashMap::new();
     if type_aliases.is_empty() {
         return targets;
     }
     for edge in edges {
-        if edge.kind == EdgeKind::Interface && type_aliases.contains(edge.from.as_str()) {
+        if edge.kind == EdgeKind::Interface && type_aliases.contains(&edge.from) {
             targets
-                .entry(edge.from.as_str())
+                .entry(edge.from)
                 .or_insert_with(Vec::new)
-                .push(edge.to.as_str());
+                .push(edge.to);
         }
     }
     targets
@@ -1114,8 +1116,9 @@ fn module_scope(tcx: TyCtxt<'_>, mut def_id: LocalDefId) -> Vec<String> {
     scope
 }
 
-fn id(tcx: TyCtxt<'_>, def_id: DefId) -> String {
-    format!("{:?}", tcx.def_path_hash(def_id))
+fn id(tcx: TyCtxt<'_>, def_id: DefId) -> DefinitionId {
+    let hash = tcx.def_path_hash(def_id);
+    DefinitionId::new(hash.stable_crate_id().as_u64(), hash.local_hash().as_u64())
 }
 
 fn span(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<Span> {
@@ -1208,7 +1211,7 @@ impl<'tcx> ReferenceVisitor<'tcx> {
         let source = id(self.tcx, self.source);
         edges.reserve(self.targets.len());
         edges.extend(self.targets.into_iter().map(|target| Edge {
-            from: source.clone(),
+            from: source,
             to: id(self.tcx, target),
             kind: self.edge_kind,
         }));
@@ -1401,7 +1404,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Hawk frontend uses compiler driver protocol 1, but this driver uses protocol 4; install `cargo-hawk` and `cargo-hawk-driver` from the same release"
+            "Hawk frontend uses compiler driver protocol 1, but this driver uses protocol 5; install `cargo-hawk` and `cargo-hawk-driver` from the same release"
         );
     }
 
@@ -1411,7 +1414,7 @@ mod tests {
             protocol_version: crate::protocol::ProtocolVersion,
             package_name: "library".into(),
             crate_name: "library".into(),
-            crate_id: "library".into(),
+            crate_id: cargo_hawk_internal::graph::DefinitionId::new(0, 1),
             crate_root: Some("library/src/lib.rs".into()),
             is_product_root: false,
             test_surface: false,
@@ -1532,27 +1535,32 @@ mod tests {
 
     #[test]
     fn interface_target_index_only_contains_type_alias_sources() {
+        let alias = cargo_hawk_internal::graph::DefinitionId::new(0, 1);
+        let target = cargo_hawk_internal::graph::DefinitionId::new(0, 2);
+        let function = cargo_hawk_internal::graph::DefinitionId::new(0, 3);
+        let argument = cargo_hawk_internal::graph::DefinitionId::new(0, 4);
+        let body_target = cargo_hawk_internal::graph::DefinitionId::new(0, 5);
         let edges = [
             Edge {
-                from: "alias".into(),
-                to: "target".into(),
+                from: alias,
+                to: target,
                 kind: EdgeKind::Interface,
             },
             Edge {
-                from: "function".into(),
-                to: "argument".into(),
+                from: function,
+                to: argument,
                 kind: EdgeKind::Interface,
             },
             Edge {
-                from: "alias".into(),
-                to: "body_target".into(),
+                from: alias,
+                to: body_target,
                 kind: EdgeKind::Body,
             },
         ];
 
-        let targets = type_alias_interface_targets(&edges, &["alias"].into_iter().collect());
+        let targets = type_alias_interface_targets(&edges, &[alias].into_iter().collect());
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets.get("alias"), Some(&vec!["target"]));
+        assert_eq!(targets.get(&alias), Some(&vec![target]));
         assert!(type_alias_interface_targets(&edges, &HashSet::new()).is_empty());
     }
 

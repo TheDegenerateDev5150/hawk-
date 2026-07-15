@@ -787,20 +787,27 @@ mod tests {
 
     use super::{AnalysisTarget, Config, ConfigDiagnosticKind};
     use cargo_hawk_internal::graph::{
-        Definition, DefinitionKind, FindingKind, Fragment, Span, analyze,
+        Definition, DefinitionId, DefinitionKind, FindingKind, Fragment, Span, analyze,
     };
+
+    fn test_id(value: &str) -> DefinitionId {
+        let hash = value.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        DefinitionId::new(0, hash)
+    }
 
     fn fragment() -> Fragment {
         Fragment {
             protocol_version: crate::protocol::ProtocolVersion,
             package_name: "library".into(),
             crate_name: "library".into(),
-            crate_id: "library".into(),
+            crate_id: test_id("library"),
             crate_root: Some("library/src/lib.rs".into()),
             is_product_root: false,
             test_surface: false,
             definitions: vec![Definition {
-                id: "unused".into(),
+                id: test_id("unused"),
                 crate_name: "library".into(),
                 name: "unused".into(),
                 kind: DefinitionKind::Function,
@@ -839,7 +846,7 @@ mod tests {
         let mut fragment = fragment();
         fragment.definitions = vec![
             Definition {
-                id: "alias".into(),
+                id: test_id("alias"),
                 crate_name: "library".into(),
                 name: "SameName".into(),
                 kind: DefinitionKind::TypeAlias,
@@ -854,7 +861,7 @@ mod tests {
                 dead_code_allowed: false,
             },
             Definition {
-                id: "constant".into(),
+                id: test_id("constant"),
                 crate_name: "library".into(),
                 name: "SameName".into(),
                 kind: DefinitionKind::Constant,
@@ -876,7 +883,7 @@ mod tests {
         let mut fragment = fragment();
         fragment.definitions = vec![
             Definition {
-                id: "generated".into(),
+                id: test_id("generated"),
                 crate_name: "library".into(),
                 name: "generated".into(),
                 kind: DefinitionKind::Module,
@@ -895,7 +902,7 @@ mod tests {
                 dead_code_allowed: false,
             },
             Definition {
-                id: "generated-unused".into(),
+                id: test_id("generated-unused"),
                 crate_name: "library".into(),
                 name: "generated::unused".into(),
                 kind: DefinitionKind::Function,
@@ -914,7 +921,7 @@ mod tests {
                 dead_code_allowed: false,
             },
             Definition {
-                id: "outside".into(),
+                id: test_id("outside"),
                 crate_name: "library".into(),
                 name: "outside".into(),
                 kind: DefinitionKind::Function,
@@ -933,7 +940,7 @@ mod tests {
                 dead_code_allowed: false,
             },
             Definition {
-                id: "generatedish".into(),
+                id: test_id("generatedish"),
                 crate_name: "library".into(),
                 name: "generatedish".into(),
                 kind: DefinitionKind::Function,
@@ -1005,8 +1012,8 @@ reason = "retain every compiled cfg alternative"
         let config = Config::load(directory.path(), Some(&path)).expect("load configuration");
 
         let mut production_fragment = fragment();
-        production_fragment.crate_id = "library-production".into();
-        production_fragment.definitions[0].id = "production-dual".into();
+        production_fragment.crate_id = test_id("library-production");
+        production_fragment.definitions[0].id = test_id("production-dual");
         production_fragment.definitions[0].name = "dual".into();
         production_fragment.definitions[0].span = Some(Span {
             file: "library/src/lib.rs".into(),
@@ -1014,8 +1021,8 @@ reason = "retain every compiled cfg alternative"
             column: 1,
         });
         let mut test_fragment = fragment();
-        test_fragment.crate_id = "library-test".into();
-        test_fragment.definitions[0].id = "test-dual".into();
+        test_fragment.crate_id = test_id("library-test");
+        test_fragment.definitions[0].id = test_id("test-dual");
         test_fragment.definitions[0].name = "dual".into();
         test_fragment.definitions[0].span = Some(Span {
             file: "library/src/lib.rs".into(),
