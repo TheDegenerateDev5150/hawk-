@@ -214,20 +214,19 @@ fn emit_fixes(tcx: TyCtxt<'_>, fix_plan: &FixPlan) {
         }
     }
 
-    let mut emitted_spans = Vec::new();
+    let unfixable_spans: HashSet<_> = visibility_fixes
+        .iter()
+        .filter_map(|(span, kind)| kind.is_none().then_some(*span))
+        .collect();
+    let mut emitted_spans = HashSet::new();
     for (span, kind) in &visibility_fixes {
         let Some(kind) = kind else {
             continue;
         };
-        if emitted_spans.contains(span)
-            || visibility_fixes
-                .iter()
-                .any(|(other_span, kind)| other_span == span && kind.is_none())
-        {
+        if unfixable_spans.contains(span) || !emitted_spans.insert(*span) {
             continue;
         }
         emit_fix(tcx, *span, *kind);
-        emitted_spans.push(*span);
     }
 }
 
@@ -262,11 +261,12 @@ impl<'a> FixPlanIndex<'a> {
         }
     }
 
-    fn get(&self, id: &str, identity: &DefinitionIdentity<'_>) -> Option<&'a FixTarget> {
-        self.by_id
-            .get(id)
-            .or_else(|| self.by_identity.get(identity))
-            .copied()
+    fn get_by_id(&self, id: &str) -> Option<&'a FixTarget> {
+        self.by_id.get(id).copied()
+    }
+
+    fn get_by_identity(&self, identity: &DefinitionIdentity<'_>) -> Option<&'a FixTarget> {
+        self.by_identity.get(identity).copied()
     }
 }
 
@@ -277,19 +277,20 @@ fn planned_fix(
     fix_plan: &FixPlanIndex<'_>,
 ) -> Option<(FindingKind, VisibilityReduction)> {
     let id = id(tcx, def_id.to_def_id());
+    if let Some(target) = fix_plan.get_by_id(&id) {
+        return Some((target.kind, target.replacement));
+    }
+
     let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
     let name = definition_name(tcx, def_id, definition_kind);
     let definition_span = span(tcx, def_id);
     fix_plan
-        .get(
-            &id,
-            &DefinitionIdentity::new(
-                &crate_name,
-                &name,
-                definition_kind,
-                definition_span.as_ref(),
-            ),
-        )
+        .get_by_identity(&DefinitionIdentity::new(
+            &crate_name,
+            &name,
+            definition_kind,
+            definition_span.as_ref(),
+        ))
         .map(|target| (target.kind, target.replacement))
 }
 
@@ -389,21 +390,34 @@ fn collect_fragment(
     let mut adt_members = Vec::new();
     let mut source_item_fields = Vec::new();
     let mut generated_fields = Vec::new();
+    let mut public_reexports = Vec::new();
     let crate_items = tcx.hir_crate_items(());
     let is_proc_macro_crate = tcx.crate_types().contains(&CrateType::ProcMacro);
 
     for owner in crate_items.owners() {
         let def_id = owner.def_id;
         let kind = diagnostic_kind(tcx, def_id);
+        let visibility = visibility_modifier(tcx, def_id);
+        let public_candidate = kind.is_some()
+            && is_public_candidate_with_visibility(
+                tcx,
+                def_id,
+                test_surface,
+                visibility.as_deref(),
+            );
         let public_api = kind
             .is_some_and(|kind| kind != DefinitionKind::Reexport || is_named_reexport(tcx, def_id))
-            && is_public_candidate(tcx, def_id, test_surface);
+            && public_candidate;
+        if kind == Some(DefinitionKind::Reexport) && public_candidate {
+            public_reexports.push(def_id);
+        }
         definitions.push(definition(
             tcx,
             def_id,
             &crate_name,
             kind.unwrap_or(DefinitionKind::Other),
             public_api,
+            visibility,
         ));
         defined.insert(def_id);
     }
@@ -426,8 +440,15 @@ fn collect_fragment(
                 );
                 for field in data.fields() {
                     let field_span = tcx.def_span(field.def_id);
+                    let visibility = visibility_modifier(tcx, field.def_id);
+                    let public_api = is_public_candidate_with_visibility(
+                        tcx,
+                        field.def_id,
+                        test_surface,
+                        visibility.as_deref(),
+                    );
                     if let Some(index) = source_item_index
-                        && is_public_candidate(tcx, field.def_id, test_surface)
+                        && public_api
                     {
                         source_item_fields[index]
                             .2
@@ -441,7 +462,8 @@ fn collect_fragment(
                         field.def_id,
                         &crate_name,
                         DefinitionKind::Field,
-                        is_public_candidate(tcx, field.def_id, test_surface),
+                        public_api,
+                        visibility,
                     );
                     field_definition
                         .uniform_field_group
@@ -459,6 +481,7 @@ fn collect_fragment(
                         &crate_name,
                         DefinitionKind::EnumVariant,
                         is_public_variant(tcx, variant.def_id, test_surface),
+                        visibility_modifier(tcx, variant.def_id),
                     ));
                     defined.insert(variant.def_id);
                     adt_members.push((variant.def_id, item.owner_id.def_id));
@@ -476,6 +499,7 @@ fn collect_fragment(
                 &crate_name,
                 DefinitionKind::Other,
                 false,
+                visibility_modifier(tcx, def_id),
             ));
         }
     }
@@ -598,12 +622,7 @@ fn collect_fragment(
         let source_file = source_file_start(tcx, source_callsite);
         let source_position = source_callsite.hi().to_u32();
         let name = tcx.item_name(field.to_def_id());
-        source_item_fields
-            .iter()
-            .find(|(file_start, item_start, _)| {
-                *file_start == source_file && *item_start >= source_position
-            })?
-            .2
+        source_item_at_or_after(&source_item_fields, source_file, source_position)?
             .iter()
             .find(|(source_name, _)| *source_name == name)
             .map(|(_, source_field)| Edge {
@@ -642,39 +661,29 @@ fn collect_fragment(
         .filter(|definition| definition.kind == DefinitionKind::TypeAlias)
         .map(|definition| definition.id.as_str())
         .collect();
-    let mut pending_required_public_roots: Vec<String> = edges
+    let interface_targets = type_alias_interface_targets(&edges, &type_aliases);
+    let mut pending_required_public_roots: Vec<&str> = edges
         .iter()
         .filter(|edge| {
             edge.kind == EdgeKind::Interface && trait_impl_interface_sources.contains(&edge.from)
         })
-        .map(|edge| edge.to.clone())
+        .map(|edge| edge.to.as_str())
         .collect();
     let mut required_public_roots = Vec::new();
     let mut examined_required_public_roots = HashSet::new();
     while let Some(target) = pending_required_public_roots.pop() {
-        if !examined_required_public_roots.insert(target.clone()) {
+        if !examined_required_public_roots.insert(target) {
             continue;
         }
-        if type_aliases.contains(target.as_str()) {
-            pending_required_public_roots.extend(
-                edges
-                    .iter()
-                    .filter(|edge| edge.kind == EdgeKind::Interface && edge.from == target)
-                    .map(|edge| edge.to.clone()),
-            );
+        if type_aliases.contains(target) {
+            pending_required_public_roots
+                .extend(interface_targets.get(target).into_iter().flatten().copied());
         } else {
-            required_public_roots.push(target);
+            required_public_roots.push(target.to_owned());
         }
     }
     // Lowering the local target of a public reexport fails with E0365 while
     // the reexport remains part of the crate interface.
-    let public_reexports: Vec<LocalDefId> = crate_items
-        .owners()
-        .map(|owner| owner.def_id)
-        .filter(|def_id| {
-            tcx.def_kind(*def_id) == DefKind::Use && is_public_candidate(tcx, *def_id, test_surface)
-        })
-        .collect();
     let public_reexport_sources: HashSet<String> = public_reexports
         .iter()
         .map(|def_id| id(tcx, def_id.to_def_id()))
@@ -765,15 +774,16 @@ fn collect_fragment(
     }
 }
 
-fn is_public_candidate(tcx: TyCtxt<'_>, def_id: LocalDefId, test_surface: bool) -> bool {
+fn is_public_candidate_with_visibility(
+    tcx: TyCtxt<'_>,
+    def_id: LocalDefId,
+    test_surface: bool,
+    visibility: Option<&str>,
+) -> bool {
     !tcx.def_span(def_id).from_expansion()
-        && has_visibility_modifier(tcx, def_id, "pub")
+        && visibility == Some("pub")
         && tcx.local_visibility(def_id).is_public()
         && (test_surface || tcx.effective_visibilities(()).is_exported(def_id))
-}
-
-fn has_visibility_modifier(tcx: TyCtxt<'_>, def_id: LocalDefId, expected: &str) -> bool {
-    visibility_modifier(tcx, def_id).as_deref() == Some(expected)
 }
 
 fn visibility_modifier(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<String> {
@@ -906,6 +916,37 @@ fn source_file_start(tcx: TyCtxt<'_>, span: rustc_span::Span) -> u32 {
         .to_u32()
 }
 
+fn source_item_at_or_after<T>(
+    source_items: &[(u32, u32, T)],
+    source_file: u32,
+    source_position: u32,
+) -> Option<&T> {
+    let index = source_items.partition_point(|(file_start, item_start, _)| {
+        (*file_start, *item_start) < (source_file, source_position)
+    });
+    let (file_start, _, item) = source_items.get(index)?;
+    (*file_start == source_file).then_some(item)
+}
+
+fn type_alias_interface_targets<'a>(
+    edges: &'a [Edge],
+    type_aliases: &HashSet<&str>,
+) -> HashMap<&'a str, Vec<&'a str>> {
+    let mut targets = HashMap::new();
+    if type_aliases.is_empty() {
+        return targets;
+    }
+    for edge in edges {
+        if edge.kind == EdgeKind::Interface && type_aliases.contains(edge.from.as_str()) {
+            targets
+                .entry(edge.from.as_str())
+                .or_insert_with(Vec::new)
+                .push(edge.to.as_str());
+        }
+    }
+    targets
+}
+
 fn is_public_variant(tcx: TyCtxt<'_>, def_id: LocalDefId, test_surface: bool) -> bool {
     !tcx.def_span(def_id).from_expansion()
         && (tcx.effective_visibilities(()).is_exported(def_id)
@@ -925,8 +966,8 @@ fn definition(
     crate_name: &str,
     kind: DefinitionKind,
     public_api: bool,
+    visibility: Option<String>,
 ) -> Definition {
-    let visibility = visibility_modifier(tcx, def_id);
     let has_explicit_visibility = visibility
         .as_deref()
         .is_some_and(|visibility| visibility.starts_with("pub"));
@@ -1266,15 +1307,17 @@ impl<'tcx> Visitor<'tcx> for ReferenceVisitor<'tcx> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::HashSet;
     use std::ffi::OsStr;
     use std::io::{self, Write};
     use std::path::Path;
 
     use super::{
         compact_visibility_modifier, normalize_source_path, parse_collection_options,
-        uniform_field_group, validate_frontend_protocol_version, write_fragment,
+        source_item_at_or_after, type_alias_interface_targets, uniform_field_group,
+        validate_frontend_protocol_version, write_fragment,
     };
-    use cargo_hawk_internal::graph::{CollectionOptions, Fragment};
+    use cargo_hawk_internal::graph::{CollectionOptions, Edge, EdgeKind, Fragment};
 
     struct FailingWriter;
 
@@ -1367,6 +1410,45 @@ mod tests {
         assert_eq!(collect(CollectionOptions::new(true)), Some("group"));
         assert_eq!(parse_count.get(), 1);
         assert_eq!(group_count.get(), 1);
+    }
+
+    #[test]
+    fn source_item_lookup_stays_within_the_matching_file() {
+        let items = [(10, 20, "first"), (10, 40, "second"), (50, 60, "third")];
+
+        assert_eq!(source_item_at_or_after(&items, 10, 1), Some(&"first"));
+        assert_eq!(source_item_at_or_after(&items, 10, 20), Some(&"first"));
+        assert_eq!(source_item_at_or_after(&items, 10, 21), Some(&"second"));
+        assert_eq!(source_item_at_or_after(&items, 10, 41), None);
+        assert_eq!(source_item_at_or_after(&items, 20, 1), None);
+        assert_eq!(source_item_at_or_after(&items, 50, 60), Some(&"third"));
+        assert_eq!(source_item_at_or_after(&items, 50, 61), None);
+    }
+
+    #[test]
+    fn interface_target_index_only_contains_type_alias_sources() {
+        let edges = [
+            Edge {
+                from: "alias".into(),
+                to: "target".into(),
+                kind: EdgeKind::Interface,
+            },
+            Edge {
+                from: "function".into(),
+                to: "argument".into(),
+                kind: EdgeKind::Interface,
+            },
+            Edge {
+                from: "alias".into(),
+                to: "body_target".into(),
+                kind: EdgeKind::Body,
+            },
+        ];
+
+        let targets = type_alias_interface_targets(&edges, &["alias"].into_iter().collect());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets.get("alias"), Some(&vec!["target"]));
+        assert!(type_alias_interface_targets(&edges, &HashSet::new()).is_empty());
     }
 
     #[test]
