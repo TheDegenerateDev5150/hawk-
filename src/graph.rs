@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::ProtocolVersion;
@@ -256,7 +257,7 @@ struct SourceDefinitionIdentity<'a> {
 #[derive(Default)]
 struct EquivalenceGroups<'a> {
     groups: Vec<Vec<&'a str>>,
-    group_by_id: HashMap<&'a str, usize>,
+    group_by_id: FxHashMap<&'a str, usize>,
 }
 
 impl<'a> EquivalenceGroups<'a> {
@@ -302,12 +303,12 @@ pub fn analyze_with_options<'a>(
         .chain(test_fragments)
         .flat_map(|fragment| &fragment.definitions)
         .collect();
-    let definitions: HashMap<&str, &Definition> = observed_definitions
+    let definitions: FxHashMap<&str, &Definition> = observed_definitions
         .iter()
         .copied()
         .map(|definition| (definition.id.as_str(), definition))
         .collect();
-    let definition_crate_ids: HashMap<&str, &str> = production_fragments
+    let definition_crate_ids: FxHashMap<&str, &str> = production_fragments
         .iter()
         .chain(test_fragments)
         .flat_map(|fragment| {
@@ -317,7 +318,7 @@ pub fn analyze_with_options<'a>(
                 .map(|definition| (definition.id.as_str(), fragment.crate_id.as_str()))
         })
         .collect();
-    let definition_compilation_ids: HashMap<&str, usize> = production_fragments
+    let definition_compilation_ids: FxHashMap<&str, usize> = production_fragments
         .iter()
         .chain(test_fragments)
         .enumerate()
@@ -328,7 +329,7 @@ pub fn analyze_with_options<'a>(
                 .map(move |definition| (definition.id.as_str(), compilation_id))
         })
         .collect();
-    let definition_fragments: HashMap<&str, &Fragment> = production_fragments
+    let definition_fragments: FxHashMap<&str, &Fragment> = production_fragments
         .iter()
         .chain(test_fragments)
         .flat_map(|fragment| {
@@ -351,6 +352,9 @@ pub fn analyze_with_options<'a>(
         .chain(&test_edges)
         .copied()
         .collect();
+    let reexport_targets = reexport_index(&edges);
+    let production_reexport_targets = reexport_index(&production_edges);
+    let test_reexport_targets = reexport_index(&test_edges);
     // Repeated `#[path]` modules compile independent definitions from the same
     // source. They must not share liveness, but any visibility edit affects all
     // of them and must account for every use.
@@ -362,12 +366,12 @@ pub fn analyze_with_options<'a>(
     let required_scopes = required_scopes(&definitions, &edges, &equivalents);
     let visibility_finding_kinds =
         visibility_finding_kinds(&definitions, &required_scopes, &visibility_equivalents);
-    let production_definition_ids: HashSet<&str> = production_fragments
+    let production_definition_ids: FxHashSet<&str> = production_fragments
         .iter()
         .flat_map(|fragment| &fragment.definitions)
         .map(|definition| definition.id.as_str())
         .collect();
-    let test_definition_ids: HashSet<&str> = test_fragments
+    let test_definition_ids: FxHashSet<&str> = test_fragments
         .iter()
         .flat_map(|fragment| &fragment.definitions)
         .map(|definition| definition.id.as_str())
@@ -397,25 +401,27 @@ pub fn analyze_with_options<'a>(
         );
     let tests = reachable(test_roots, &test_adjacency);
 
-    let mut explicitly_required: HashSet<&str> = production_fragments
+    let mut explicitly_required: FxHashSet<&str> = production_fragments
         .iter()
         .chain(test_fragments)
         .flat_map(|fragment| fragment.required_public_roots.iter().map(String::as_str))
         .collect();
-    let no_explicitly_required = HashSet::new();
+    let no_explicitly_required = FxHashSet::default();
+    let interface_adjacency = interface_adjacency(&definitions, &edges, &visibility_equivalents);
     let externally_required_visibility = required_public_visibility(
-        &definitions,
         &definition_crate_ids,
         &edges,
-        &visibility_equivalents,
+        &interface_adjacency,
         &no_explicitly_required,
     );
     for definition in definitions
         .values()
         .filter(|definition| definition.public_api && definition.kind == DefinitionKind::Reexport)
     {
-        let targets = reexport_targets(definition.id.as_str(), &edges);
-        if !is_analyzable_reexport(&targets, &definitions)
+        let targets = reexport_targets
+            .get(definition.id.as_str())
+            .map_or(&[][..], Vec::as_slice);
+        if !is_analyzable_reexport(targets, &definitions)
             || targets
                 .iter()
                 .any(|target| externally_required_visibility.contains(target))
@@ -424,39 +430,38 @@ pub fn analyze_with_options<'a>(
         }
     }
     let required_public_visibility = required_public_visibility(
-        &definitions,
         &definition_crate_ids,
         &edges,
-        &visibility_equivalents,
+        &interface_adjacency,
         &explicitly_required,
     );
 
     let mut findings = Vec::new();
-    let mut reported = HashSet::new();
-    let production_definitions: HashSet<_> = production_fragments
+    let mut reported = FxHashSet::default();
+    let production_definitions: FxHashSet<_> = production_fragments
         .iter()
         .flat_map(|fragment| &fragment.definitions)
         .map(definition_identity)
         .collect();
-    let production_candidates: HashSet<_> = production_fragments
+    let production_candidates: FxHashSet<_> = production_fragments
         .iter()
         .flat_map(|fragment| &fragment.definitions)
         .filter(|definition| definition.public_api)
         .map(definition_identity)
         .collect();
-    let production_restricted_visible_candidates: HashSet<_> = production_fragments
+    let production_restricted_visible_candidates: FxHashSet<_> = production_fragments
         .iter()
         .flat_map(|fragment| &fragment.definitions)
         .filter(|definition| definition.restricted_visible_api)
         .map(definition_identity)
         .collect();
-    let production_root_definitions: HashSet<_> = production_fragments
+    let production_root_definitions: FxHashSet<_> = production_fragments
         .iter()
         .filter(|fragment| fragment.is_product_root)
         .flat_map(|fragment| &fragment.definitions)
         .map(definition_identity)
         .collect();
-    let non_production_root_definitions: HashSet<_> = test_fragments
+    let non_production_root_definitions: FxHashSet<_> = test_fragments
         .iter()
         .filter(|fragment| fragment.is_product_root && !fragment.test_surface)
         .flat_map(|fragment| &fragment.definitions)
@@ -492,8 +497,13 @@ pub fn analyze_with_options<'a>(
         }
 
         let test_compiled_only = !production_definitions.contains(&identity);
-        let is_production_live = is_live(definition, &production_edges, &production, &equivalents);
-        let is_test_live = is_live(definition, &test_edges, &tests, &equivalents);
+        let is_production_live = is_live(
+            definition,
+            &production_reexport_targets,
+            &production,
+            &equivalents,
+        );
+        let is_test_live = is_live(definition, &test_reexport_targets, &tests, &equivalents);
         if !is_production_live && !is_test_live {
             findings.push(Finding {
                 kind: FindingKind::DeadPublic,
@@ -550,8 +560,13 @@ pub fn analyze_with_options<'a>(
         };
         reported.insert(identity);
         let test_compiled_only = !production_definitions.contains(&identity);
-        let is_production_live = is_live(definition, &production_edges, &production, &equivalents);
-        let is_test_live = is_live(definition, &test_edges, &tests, &equivalents);
+        let is_production_live = is_live(
+            definition,
+            &production_reexport_targets,
+            &production,
+            &equivalents,
+        );
+        let is_test_live = is_live(definition, &test_reexport_targets, &tests, &equivalents);
         findings.push(Finding {
             kind,
             definition,
@@ -593,12 +608,12 @@ fn field_group_identity(definition: &Definition) -> Option<&Span> {
 fn suppress_uniform_field_visibility_findings<'a>(
     findings: &mut Vec<Finding<'a>>,
     observed_definitions: &[&'a Definition],
-    required_public_visibility: &HashSet<&str>,
-    required_scopes: &HashMap<&str, RequiredScope>,
+    required_public_visibility: &FxHashSet<&str>,
+    required_scopes: &FxHashMap<&str, RequiredScope>,
     equivalents: &EquivalenceGroups<'_>,
     visibility_finding_kinds: &[Option<FindingKind>],
 ) {
-    let protected_groups: HashSet<_> = observed_definitions
+    let protected_groups: FxHashSet<_> = observed_definitions
         .iter()
         .filter_map(|definition| {
             let identity = field_group_identity(definition)?;
@@ -629,7 +644,7 @@ fn suppress_uniform_field_visibility_findings<'a>(
 
 fn has_known_restricted_visibility_requirement(
     definition: &Definition,
-    required_scopes: &HashMap<&str, RequiredScope>,
+    required_scopes: &FxHashMap<&str, RequiredScope>,
     equivalents: &EquivalenceGroups<'_>,
     visibility_finding_kinds: &[Option<FindingKind>],
 ) -> bool {
@@ -648,7 +663,7 @@ fn has_known_restricted_visibility_requirement(
 
 fn restricted_visibility_finding_kind(
     definition: &Definition,
-    required_scopes: &HashMap<&str, RequiredScope>,
+    required_scopes: &FxHashMap<&str, RequiredScope>,
     equivalents: &EquivalenceGroups<'_>,
     visibility_finding_kinds: &[Option<FindingKind>],
 ) -> Option<FindingKind> {
@@ -662,8 +677,8 @@ fn restricted_visibility_finding_kind(
 }
 
 fn visibility_finding_kinds(
-    definitions: &HashMap<&str, &Definition>,
-    required_scopes: &HashMap<&str, RequiredScope>,
+    definitions: &FxHashMap<&str, &Definition>,
+    required_scopes: &FxHashMap<&str, RequiredScope>,
     equivalents: &EquivalenceGroups<'_>,
 ) -> Vec<Option<FindingKind>> {
     equivalents
@@ -686,7 +701,7 @@ fn visibility_finding_kinds(
 
 fn restricted_visibility_finding_kind_for_instance(
     definition: &Definition,
-    required_scopes: &HashMap<&str, RequiredScope>,
+    required_scopes: &FxHashMap<&str, RequiredScope>,
 ) -> Option<FindingKind> {
     if matches!(
         definition.kind,
@@ -788,12 +803,12 @@ impl RequiredScope {
 }
 
 fn required_scopes<'a>(
-    definitions: &HashMap<&'a str, &'a Definition>,
+    definitions: &FxHashMap<&'a str, &'a Definition>,
     edges: &[&'a Edge],
     equivalents: &EquivalenceGroups<'a>,
-) -> HashMap<&'a str, RequiredScope> {
-    let mut required_scopes: HashMap<&str, RequiredScope> = HashMap::new();
-    let mut propagation: HashMap<&str, Vec<&str>> = HashMap::new();
+) -> FxHashMap<&'a str, RequiredScope> {
+    let mut required_scopes: FxHashMap<&str, RequiredScope> = FxHashMap::default();
+    let mut propagation: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
     let mut pending = VecDeque::new();
     for edge in edges {
         if edge.from == edge.to || !definitions.contains_key(edge.to.as_str()) {
@@ -854,14 +869,14 @@ fn propagates_visibility_requirement(kind: EdgeKind) -> bool {
 
 fn is_live(
     definition: &Definition,
-    edges: &[&Edge],
-    reachable: &HashSet<&str>,
+    reexport_targets: &FxHashMap<&str, Vec<&str>>,
+    reachable: &FxHashSet<&str>,
     equivalents: &EquivalenceGroups<'_>,
 ) -> bool {
     let equivalent_ids = equivalents.group(definition.id.as_str()).iter().copied();
     let ids = std::iter::once(definition.id.as_str()).chain(equivalent_ids);
     if definition.kind == DefinitionKind::Reexport {
-        ids.flat_map(|id| reexport_targets(id, edges))
+        ids.flat_map(|id| reexport_targets.get(id).into_iter().flatten().copied())
             .any(|target| reachable.contains(target))
     } else {
         ids.into_iter().any(|id| reachable.contains(id))
@@ -869,57 +884,57 @@ fn is_live(
 }
 
 fn required_public_visibility<'a>(
-    definitions: &HashMap<&'a str, &'a Definition>,
-    definition_crate_ids: &HashMap<&'a str, &'a str>,
+    definition_crate_ids: &FxHashMap<&'a str, &'a str>,
     edges: &[&'a Edge],
-    equivalents: &EquivalenceGroups<'a>,
-    explicitly_required: &HashSet<&'a str>,
-) -> HashSet<&'a str> {
-    let mut required = explicitly_required.clone();
+    interface_adjacency: &FxHashMap<&'a str, Vec<&'a str>>,
+    explicitly_required: &FxHashSet<&'a str>,
+) -> FxHashSet<&'a str> {
     // Rust privacy-checks every compiled item, including items outside the
     // selected product's runtime reachability graph.
-    required.extend(edges.iter().filter_map(|edge| {
-        let from = definition_crate_ids.get(edge.from.as_str())?;
-        let to = definition_crate_ids.get(edge.to.as_str())?;
-        (from != to).then_some(edge.to.as_str())
-    }));
+    let roots = explicitly_required
+        .iter()
+        .copied()
+        .chain(edges.iter().filter_map(|edge| {
+            let from = definition_crate_ids.get(edge.from.as_str())?;
+            let to = definition_crate_ids.get(edge.to.as_str())?;
+            (from != to).then_some(edge.to.as_str())
+        }));
 
-    let mut interface_edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    reachable(roots, interface_adjacency)
+}
+
+fn interface_adjacency<'a>(
+    definitions: &FxHashMap<&'a str, &'a Definition>,
+    edges: &[&'a Edge],
+    equivalents: &EquivalenceGroups<'a>,
+) -> FxHashMap<&'a str, Vec<&'a str>> {
+    let mut adjacency: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
     for edge in edges {
         if propagates_visibility_requirement(edge.kind)
             && definitions.contains_key(edge.to.as_str())
         {
-            interface_edges
+            adjacency
                 .entry(edge.from.as_str())
                 .or_default()
                 .push(edge.to.as_str());
         }
     }
-    extend_equivalence_edges(&mut interface_edges, equivalents, None);
+    extend_equivalence_edges(&mut adjacency, equivalents, None);
+    adjacency
+}
 
-    let mut pending: Vec<&str> = required.iter().copied().collect();
-    while let Some(from) = pending.pop() {
-        if let Some(targets) = interface_edges.get(from) {
-            for target in targets {
-                if required.insert(target) {
-                    pending.push(target);
-                }
-            }
-        }
+fn reexport_index<'a>(edges: &[&'a Edge]) -> FxHashMap<&'a str, Vec<&'a str>> {
+    let mut reexports: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
+    for edge in edges.iter().filter(|edge| edge.kind == EdgeKind::Reexport) {
+        reexports
+            .entry(edge.from.as_str())
+            .or_default()
+            .push(edge.to.as_str());
     }
-
-    required
+    reexports
 }
 
-fn reexport_targets<'a>(source: &str, edges: &'a [&Edge]) -> Vec<&'a str> {
-    edges
-        .iter()
-        .filter(|edge| edge.kind == EdgeKind::Reexport && edge.from == source)
-        .map(|edge| edge.to.as_str())
-        .collect()
-}
-
-fn is_analyzable_reexport(targets: &[&str], definitions: &HashMap<&str, &Definition>) -> bool {
+fn is_analyzable_reexport(targets: &[&str], definitions: &FxHashMap<&str, &Definition>) -> bool {
     !targets.is_empty()
         && targets.iter().all(|target| {
             definitions.get(target).is_some_and(|definition| {
@@ -942,9 +957,9 @@ fn is_analyzable_reexport(targets: &[&str], definitions: &HashMap<&str, &Definit
 fn adjacency<'a>(
     edges: &[&'a Edge],
     equivalents: &EquivalenceGroups<'a>,
-    definition_ids: &HashSet<&str>,
-) -> HashMap<&'a str, Vec<&'a str>> {
-    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    definition_ids: &FxHashSet<&str>,
+) -> FxHashMap<&'a str, Vec<&'a str>> {
+    let mut adjacency: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
     for edge in edges {
         if edge.kind == EdgeKind::VisibilityRequirement {
             continue;
@@ -959,11 +974,12 @@ fn adjacency<'a>(
 }
 
 fn equivalent_definitions<'a>(
-    definitions: &HashMap<&'a str, &'a Definition>,
-    definition_compilation_ids: &HashMap<&'a str, usize>,
-    definition_fragments: &HashMap<&'a str, &'a Fragment>,
+    definitions: &FxHashMap<&'a str, &'a Definition>,
+    definition_compilation_ids: &FxHashMap<&'a str, usize>,
+    definition_fragments: &FxHashMap<&'a str, &'a Fragment>,
 ) -> (EquivalenceGroups<'a>, EquivalenceGroups<'a>) {
-    let mut groups: HashMap<SourceDefinitionIdentity<'a>, Vec<(&'a str, usize)>> = HashMap::new();
+    let mut groups: FxHashMap<SourceDefinitionIdentity<'a>, Vec<(&'a str, usize)>> =
+        FxHashMap::default();
     for definition in definitions.values() {
         let Some(identity) =
             source_definition_identity(definition, definition_fragments[definition.id.as_str()])
@@ -979,7 +995,7 @@ fn equivalent_definitions<'a>(
     let mut equivalents = EquivalenceGroups::default();
     let mut visibility_equivalents = EquivalenceGroups::default();
     for group in groups.into_values().filter(|group| group.len() > 1) {
-        let mut compilation_ids = HashSet::new();
+        let mut compilation_ids = FxHashSet::default();
         let share_liveness = group
             .iter()
             .all(|(_, compilation_id)| compilation_ids.insert(*compilation_id));
@@ -993,9 +1009,9 @@ fn equivalent_definitions<'a>(
 }
 
 fn extend_equivalence_edges<'a>(
-    adjacency: &mut HashMap<&'a str, Vec<&'a str>>,
+    adjacency: &mut FxHashMap<&'a str, Vec<&'a str>>,
     equivalents: &EquivalenceGroups<'a>,
-    definition_ids: Option<&HashSet<&str>>,
+    definition_ids: Option<&FxHashSet<&str>>,
 ) {
     for group in &equivalents.groups {
         let mut ids = group
@@ -1057,9 +1073,9 @@ fn source_definition_identity<'a>(
 
 fn reachable<'a>(
     roots: impl IntoIterator<Item = &'a str>,
-    adjacency: &HashMap<&'a str, Vec<&'a str>>,
-) -> HashSet<&'a str> {
-    let mut live = HashSet::new();
+    adjacency: &FxHashMap<&'a str, Vec<&'a str>>,
+) -> FxHashSet<&'a str> {
+    let mut live = FxHashSet::default();
     let mut pending: Vec<&str> = roots.into_iter().collect();
     while let Some(id) = pending.pop() {
         if live.insert(id)
@@ -1075,11 +1091,13 @@ fn reachable<'a>(
 mod tests {
     use super::{
         Definition, DefinitionKind, Edge, EdgeKind, ExpansionSpan, Finding, FindingKind, Fragment,
-        RequiredScope, Span, VisibilityReduction, analyze as analyze_with_tests,
-        analyze_with_options, equivalent_definitions, extend_equivalence_edges,
+        RequiredScope, Span, VisibilityReduction, adjacency, analyze as analyze_with_tests,
+        analyze_with_options, equivalent_definitions, extend_equivalence_edges, reachable,
+        reexport_index,
     };
     use crate::protocol::ProtocolVersion;
-    use std::collections::{HashMap, HashSet};
+    use rustc_hash::{FxHashMap, FxHashSet};
+    use std::collections::HashSet;
 
     fn analyze<'a>(
         fragments: &'a [Fragment],
@@ -2384,6 +2402,83 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_compilation_units_use_linear_equivalence_edges() {
+        const DEFINITIONS: usize = 256;
+
+        let definitions = (0..DEFINITIONS)
+            .map(|index| {
+                let id = format!("duplicate_{index}");
+                let mut definition = node(&id, "lib", true);
+                definition.name = "duplicate".into();
+                definition.span = Some(Span {
+                    file: "lib/src/lib.rs".into(),
+                    line: 1,
+                    column: 1,
+                });
+                definition
+            })
+            .collect::<Vec<_>>();
+        let definitions_by_id = definitions
+            .iter()
+            .map(|definition| (definition.id.as_str(), definition))
+            .collect::<FxHashMap<_, _>>();
+        let compilation_ids = definitions
+            .iter()
+            .enumerate()
+            .map(|(compilation_id, definition)| (definition.id.as_str(), compilation_id))
+            .collect::<FxHashMap<_, _>>();
+        let definition_ids = definitions
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect::<FxHashSet<_>>();
+        let fragments = fragments(Vec::new(), Vec::new());
+        let definition_fragments = definitions
+            .iter()
+            .map(|definition| (definition.id.as_str(), &fragments[0]))
+            .collect::<FxHashMap<_, _>>();
+        let (equivalents, _) =
+            equivalent_definitions(&definitions_by_id, &compilation_ids, &definition_fragments);
+
+        assert_eq!(equivalents.groups.len(), 1);
+        assert_eq!(equivalents.groups[0].len(), DEFINITIONS);
+        assert_eq!(equivalents.group_by_id.len(), DEFINITIONS);
+
+        let adjacency = adjacency(&[], &equivalents, &definition_ids);
+        let equivalence_edges = adjacency.values().map(Vec::len).sum::<usize>();
+        assert_eq!(equivalence_edges, 2 * (DEFINITIONS - 1));
+        assert_eq!(
+            reachable([definitions[0].id.as_str()], &adjacency).len(),
+            DEFINITIONS
+        );
+    }
+
+    #[test]
+    fn reexport_index_only_contains_reexport_edges() {
+        let edges = [
+            Edge {
+                from: "first".into(),
+                to: "target_a".into(),
+                kind: EdgeKind::Reexport,
+            },
+            Edge {
+                from: "first".into(),
+                to: "helper".into(),
+                kind: EdgeKind::Body,
+            },
+            Edge {
+                from: "first".into(),
+                to: "target_b".into(),
+                kind: EdgeKind::Reexport,
+            },
+        ];
+        let edges = edges.iter().collect::<Vec<_>>();
+        let reexports = reexport_index(&edges);
+
+        assert_eq!(reexports.len(), 1);
+        assert_eq!(reexports["first"], ["target_a", "target_b"]);
+    }
+
+    #[test]
     fn spanless_declarations_in_different_crates_do_not_share_liveness() {
         let mut input = fragments(vec![node("generated_live", "lib", true)], vec![]);
         input[1].definitions[0].name = "generated".into();
@@ -2759,7 +2854,7 @@ mod tests {
         assert_eq!(visibility.groups[0].len(), DEFINITIONS);
         assert_eq!(visibility.group_by_id.len(), DEFINITIONS);
 
-        let mut adjacency = HashMap::new();
+        let mut adjacency = FxHashMap::default();
         extend_equivalence_edges(&mut adjacency, &visibility, None);
         assert_eq!(
             adjacency.values().map(Vec::len).sum::<usize>(),
