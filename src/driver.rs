@@ -30,8 +30,8 @@ use rustc_span::{BytePos, FileName, Pos};
 
 use crate::protocol;
 use cargo_hawk_internal::graph::{
-    CollectionOptions, Definition, DefinitionIdentity, DefinitionKind, Edge, EdgeKind, FindingKind,
-    FixPlan, FixTarget, Fragment, Span, VisibilityReduction,
+    CollectionOptions, Definition, DefinitionIdentity, DefinitionKind, Edge, EdgeKind,
+    ExpansionSpan, FindingKind, FixPlan, FixTarget, Fragment, Span, VisibilityReduction,
 };
 
 pub(crate) fn is_protocol_version_query(args: &[String]) -> bool {
@@ -766,6 +766,7 @@ fn collect_fragment(
         package_name,
         crate_name,
         crate_id,
+        crate_root: span(tcx, CRATE_DEF_ID).map(|span| span.file),
         is_product_root,
         test_surface,
         definitions,
@@ -984,6 +985,7 @@ fn definition(
         name: definition_name(tcx, def_id, kind),
         kind,
         span: span(tcx, def_id),
+        expansion_span: expansion_span(tcx, def_id),
         public_api,
         restricted_visible_api,
         crate_visible_api: restricted_visible_api
@@ -1081,6 +1083,21 @@ fn span(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<Span> {
         return None;
     }
     Some(source_span(tcx, span))
+}
+
+fn expansion_span(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<ExpansionSpan> {
+    let span = tcx.def_span(def_id);
+    if !span.from_expansion() || span.is_dummy() {
+        return None;
+    }
+    let callsite = span.source_callsite();
+    if callsite.is_dummy() {
+        return None;
+    }
+    Some(ExpansionSpan {
+        definition: source_span(tcx, span),
+        callsite: source_span(tcx, callsite),
+    })
 }
 
 fn source_span(tcx: TyCtxt<'_>, span: rustc_span::Span) -> Span {
@@ -1343,7 +1360,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Hawk frontend uses compiler driver protocol 1, but this driver uses protocol 2; install `cargo-hawk` and `cargo-hawk-driver` from the same release"
+            "Hawk frontend uses compiler driver protocol 1, but this driver uses protocol 4; install `cargo-hawk` and `cargo-hawk-driver` from the same release"
         );
     }
 
@@ -1354,6 +1371,7 @@ mod tests {
             package_name: "library".into(),
             crate_name: "library".into(),
             crate_id: "library".into(),
+            crate_root: Some("library/src/lib.rs".into()),
             is_product_root: false,
             test_surface: false,
             definitions: vec![],
