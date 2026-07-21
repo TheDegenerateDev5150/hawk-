@@ -465,7 +465,7 @@ fn diagnoses_public_surface_of_a_binary_product() {
     assert!(unrelated_json.exists());
     let stdout = context.normalized_stdout(&output);
     let summary = format!(
-        "hawk: 42 finding(s) for `app --bin app --all-features` and workspace non-production targets on target `{host_target}`\n"
+        "hawk: 42 finding(s) for `app --bin app --all-features` and workspace non-production targets on target `{host_target}`\n  hawk::dead_public: 15 (library: 14, test_support: 1)\n  hawk::unfulfilled_expectation: 1 (configuration: 1)\n  hawk::unknown_item: 1 (configuration: 1)\n  hawk::unnecessary_public: 25 (library: 22, test_support: 1, unit_support: 2)\n"
     );
     let diagnostics = stdout
         .strip_suffix(&summary)
@@ -1961,6 +1961,8 @@ fn override_does_not_suppress_a_same_named_item_in_another_crate() {
     assert!(!stdout.contains("hawk::ambiguous_item"));
     assert!(!stdout.contains("hawk::unfulfilled_expectation"));
     assert!(stdout.contains("hawk: 1 finding(s)"));
+    assert!(stdout.contains("  hawk::dead_public: 1 (right-package: 1)"));
+    assert!(!stdout.contains("right_shared: 1"));
 }
 
 #[test]
@@ -2110,4 +2112,53 @@ fn narrows_crate_visibility_to_the_required_module_scope_when_enabled() {
     assert!(library.contains("    fn parent_helper() {}"));
     assert!(library.contains("        pub(super) fn call_parent_helper() {"));
     assert!(library.contains("    pub(crate) mod api {"));
+}
+
+#[test]
+fn reports_only_dead_public_findings() {
+    let context = HawkTestContext::new("basic");
+    let output = context.run(&["--only", "dead-public"]);
+
+    context.assert_success(&output);
+    let stdout = context.normalized_stdout(&output);
+    assert!(stdout.contains("warning[hawk::dead_public]"));
+    assert!(!stdout.contains("warning[hawk::unnecessary_public]"));
+    assert!(stdout.contains("warning[hawk::unknown_item]"));
+    assert!(stdout.contains("warning[hawk::unfulfilled_expectation]"));
+    assert!(stdout.contains("hawk: 17 finding(s)"));
+    assert!(stdout.contains("  hawk::dead_public: 15 (library: 14, test_support: 1)"));
+    assert!(stdout.contains("  hawk::unknown_item: 1 (configuration: 1)"));
+    assert!(!stdout.contains("  hawk::unnecessary_public:"));
+}
+
+#[test]
+fn reports_only_dead_public_findings_as_json() {
+    let context = HawkTestContext::new("basic");
+    let output = context.run(&["--only", "dead-public", "--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["summary"]["diagnostic_count"], 17);
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array");
+    assert_eq!(diagnostics.len(), 17);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["category"] == "configuration"
+                || diagnostic["code"] == "hawk::dead_public")
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["category"] == "configuration")
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "hawk::unnecessary_public")
+    );
 }
