@@ -4,14 +4,16 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, Write as _};
+use std::io::{BufReader, PipeReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::time::Duration;
 
 use anstyle::Style;
 use anyhow::{Context, Result, bail};
 use cargo_metadata::{MetadataCommand, TargetKind};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use tempfile::NamedTempFile;
 
 use crate::config::{AnalysisTarget, Config, ConfigDiagnosticKind, FeatureProfile};
 use crate::diagnostics::{DiagnosticRenderer, EMPHASIS, ERROR, WARNING, styled};
@@ -20,8 +22,8 @@ use crate::toolchain::{
     RustToolchain, clear_protocol_environment, driver_executable, validate_driver_protocol,
 };
 use cargo_hawk_internal::graph::{
-    CollectionOptions, Definition, DefinitionIdentity, Finding, FindingKind, FixPlan, FixTarget,
-    Fragment, analyze_with_options,
+    CollectionOptions, Definition, DefinitionIdentity, DefinitionKind, Finding, FindingKind,
+    FixPlan, FixTarget, Fragment, analyze_with_options,
 };
 
 #[derive(Debug, Parser)]
@@ -99,6 +101,10 @@ struct CheckArgs {
     /// Control when colored output is used.
     #[arg(long, value_enum, default_value_t, value_name = "WHEN")]
     color: TerminalColor,
+
+    /// Select the diagnostic output format.
+    #[arg(long, value_enum, default_value_t, value_name = "FORMAT")]
+    output_format: OutputFormat,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -251,6 +257,16 @@ enum TerminalColor {
 
     /// Never display colors.
     Never,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    /// Emit human-readable diagnostics.
+    #[default]
+    Text,
+
+    /// Emit a versioned JSON diagnostic report.
+    Json,
 }
 
 impl From<TerminalColor> for anstream::ColorChoice {
@@ -445,7 +461,12 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         target_dir: &target_dir,
         driver: &driver,
         toolchain: &toolchain,
-        collection_options: CollectionOptions::new(config.preserve_uniform_field_visibility()),
+        collection_options: if args.output_format == OutputFormat::Json {
+            CollectionOptions::new(config.preserve_uniform_field_visibility())
+                .with_declaration_spans()
+        } else {
+            CollectionOptions::new(config.preserve_uniform_field_visibility())
+        },
         doctest_packages: doctest_packages.as_deref(),
     };
     let mut production_fragments = Vec::new();
@@ -586,6 +607,21 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         ),
     );
     let mut renderer = DiagnosticRenderer::new(&workspace_root);
+    let definition_packages: HashMap<_, _> = if args.output_format == OutputFormat::Json {
+        production_fragments
+            .iter()
+            .chain(&test_fragments)
+            .flat_map(|fragment| {
+                fragment
+                    .definitions
+                    .iter()
+                    .map(|definition| (definition.id, fragment.package_name.as_str()))
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let mut json_diagnostics = Vec::new();
     let mut diagnostic_count = 0;
     let mut has_denied_diagnostic = false;
     let production_description = if production_products.len() == 1 {
@@ -598,9 +634,16 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         if level.is_emitted() {
             diagnostic_count += 1;
             has_denied_diagnostic |= level == LintLevel::Deny;
-            renderer
-                .write_diagnostic(finding, &production_description, level)
-                .expect("formatting diagnostics into a string cannot fail");
+            match args.output_format {
+                OutputFormat::Text => renderer
+                    .write_diagnostic(finding, &production_description, level)
+                    .expect("formatting diagnostics into a string cannot fail"),
+                OutputFormat::Json => json_diagnostics.push(json_finding(
+                    finding,
+                    level,
+                    definition_packages.get(&finding.definition.id).copied(),
+                )),
+            }
         }
     }
     for diagnostic in &findings.config_diagnostics {
@@ -608,9 +651,17 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         if level.is_emitted() {
             diagnostic_count += 1;
             has_denied_diagnostic |= level == LintLevel::Deny;
-            renderer
-                .write_config_diagnostic(diagnostic, &config, level)
-                .expect("formatting diagnostics into a string cannot fail");
+            match args.output_format {
+                OutputFormat::Text => renderer
+                    .write_config_diagnostic(diagnostic, &config, level)
+                    .expect("formatting diagnostics into a string cannot fail"),
+                OutputFormat::Json => json_diagnostics.push(json_config_diagnostic(
+                    diagnostic,
+                    &config,
+                    &workspace_root,
+                    level,
+                )),
+            }
         }
     }
     let compilation_target = args.target.as_deref().map_or_else(
@@ -618,18 +669,194 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         |target| format!("target `{target}`"),
     );
     let production_summary = production_summary(&production_products, config.feature_profiles());
-    renderer
-        .write_summary(diagnostic_count, &production_summary, &compilation_target)
-        .expect("formatting diagnostics into a string cannot fail");
-    let diagnostics = renderer.into_output();
-    anstream::AutoStream::new(std::io::stdout(), args.color.into())
-        .write_all(diagnostics.as_bytes())
-        .context("write diagnostic output")?;
+    match args.output_format {
+        OutputFormat::Text => {
+            renderer
+                .write_summary(diagnostic_count, &production_summary, &compilation_target)
+                .expect("formatting diagnostics into a string cannot fail");
+            let diagnostics = renderer.into_output();
+            anstream::AutoStream::new(std::io::stdout(), args.color.into())
+                .write_all(diagnostics.as_bytes())
+                .context("write diagnostic output")?;
+        }
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "schema_version": 3,
+                "summary": {
+                    "diagnostic_count": diagnostic_count,
+                    "target": args.target.as_deref().unwrap_or(toolchain.host()),
+                    "production": production_products
+                        .iter()
+                        .map(|product| serde_json::json!({
+                            "package": product.package,
+                            "binary": product.binary,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "feature_profiles": config
+                        .feature_profiles()
+                        .iter()
+                        .map(FeatureProfile::name)
+                        .collect::<Vec<_>>(),
+                    "includes_non_production_targets": true,
+                },
+                "diagnostics": json_diagnostics,
+            });
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            serde_json::to_writer_pretty(&mut stdout, &output)
+                .context("serialize JSON diagnostic output")?;
+            writeln!(stdout).context("write JSON diagnostic output")?;
+        }
+    }
     Ok(if has_denied_diagnostic {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn json_finding(
+    finding: &Finding<'_>,
+    level: LintLevel,
+    package: Option<&str>,
+) -> serde_json::Value {
+    let definition = finding.definition;
+    serde_json::json!({
+        "category": "finding",
+        "code": finding.kind.code(),
+        "severity": level.severity(),
+        "kind": json_finding_kind(finding.kind),
+        "identity": {
+            "id": stable_finding_id(definition, package),
+            "compiler_id": definition.id.to_string(),
+            "package": package,
+            "crate": definition.crate_name,
+            "item": definition.name,
+            "kind": json_definition_kind(definition.kind),
+            "parent": definition.name.rsplit_once("::").map(|(parent, _)| parent),
+            "module_scope": definition.module_scope,
+        },
+        "location": definition.declaration_span.as_ref().map_or_else(
+            || definition.span.as_ref().map(|span| serde_json::json!({
+                "file": span.file,
+                "line": span.line,
+                "column": span.column,
+            })),
+            |span| Some(serde_json::json!({
+                "file": span.file,
+                "byte_start": span.byte_start,
+                "byte_end": span.byte_end,
+                "line": span.start_line,
+                "column": span.start_column,
+                "end_line": span.end_line,
+                "end_column": span.end_column,
+            })),
+        ),
+        "expansion": definition.expansion_span,
+        "test_only": finding.test_only,
+        "test_compiled_only": finding.test_compiled_only,
+    })
+}
+
+/// Builds a target-independent finding identity from length-prefixed semantic and source components.
+fn stable_finding_id(definition: &Definition, package: Option<&str>) -> String {
+    let source = definition
+        .span
+        .as_ref()
+        .map(|span| ("source", span.file.as_str(), span.line, span.column))
+        .or_else(|| {
+            definition.declaration_span.as_ref().map(|span| {
+                (
+                    "declaration",
+                    span.file.as_str(),
+                    span.start_line,
+                    span.start_column,
+                )
+            })
+        })
+        .or_else(|| {
+            definition.expansion_span.as_ref().map(|span| {
+                (
+                    "expansion-callsite",
+                    span.callsite.file.as_str(),
+                    span.callsite.line,
+                    span.callsite.column,
+                )
+            })
+        })
+        .unwrap_or(("none", "", 0, 0));
+    let mut id = String::from("v1");
+    for component in [
+        package.unwrap_or(""),
+        definition.crate_name.as_str(),
+        definition.name.as_str(),
+        json_definition_kind(definition.kind),
+        source.0,
+        source.1,
+    ] {
+        write!(id, "|{}:{component}", component.len())
+            .expect("formatting a stable diagnostic ID cannot fail");
+    }
+    write!(id, "|{}|{}", source.2, source.3)
+        .expect("formatting a stable diagnostic ID cannot fail");
+    id
+}
+
+fn json_config_diagnostic(
+    diagnostic: &crate::config::ConfigDiagnostic<'_>,
+    config: &Config,
+    workspace_root: &Path,
+    level: LintLevel,
+) -> serde_json::Value {
+    let entry = diagnostic.entry;
+    let path = config.path().expect("diagnostic requires a loaded config");
+    let path = path.strip_prefix(workspace_root).unwrap_or(path);
+    serde_json::json!({
+        "category": "configuration",
+        "code": diagnostic.kind.code(),
+        "severity": level.severity(),
+        "lint": entry.lint.code(),
+        "identity": {
+            "crate": entry.crate_name,
+            "item": entry.item,
+            "kind": entry.definition_kind.map(json_definition_kind),
+        },
+        "location": {
+            "file": path,
+            "line": entry.span.line,
+            "column": entry.span.column,
+        },
+        "reason": entry.reason,
+    })
+}
+
+const fn json_finding_kind(kind: FindingKind) -> &'static str {
+    match kind {
+        FindingKind::DeadPublic => "dead_public",
+        FindingKind::UnnecessaryPublic => "unnecessary_public",
+        FindingKind::UnnecessaryRestrictedVisibility => "unnecessary_restricted_visibility",
+        FindingKind::UnnecessaryCrateVisibility => "unnecessary_crate_visibility",
+    }
+}
+
+const fn json_definition_kind(kind: DefinitionKind) -> &'static str {
+    match kind {
+        DefinitionKind::Function => "function",
+        DefinitionKind::InherentMethod => "inherent_method",
+        DefinitionKind::InherentAssociatedConstant => "inherent_associated_constant",
+        DefinitionKind::Trait => "trait",
+        DefinitionKind::Struct => "struct",
+        DefinitionKind::Enum => "enum",
+        DefinitionKind::Union => "union",
+        DefinitionKind::TypeAlias => "type_alias",
+        DefinitionKind::Constant => "constant",
+        DefinitionKind::Static => "static",
+        DefinitionKind::Field => "field",
+        DefinitionKind::EnumVariant => "enum_variant",
+        DefinitionKind::Reexport => "reexport",
+        DefinitionKind::Module => "module",
+        DefinitionKind::Other => "other",
+    }
 }
 
 pub(crate) fn write_error(raw_args: &[String], error: &anyhow::Error) -> Result<()> {
@@ -721,6 +948,116 @@ struct ConfiguredCargoCommand {
     command: Command,
     subcommand: &'static str,
     capture_output: bool,
+    cargo_output: Option<CargoOutputCapture>,
+}
+
+/// Captures Cargo's combined output without allowing inherited writers to keep analysis alive.
+struct CargoOutputCapture {
+    output: NamedTempFile,
+    reader: PipeReader,
+}
+
+impl CargoOutputCapture {
+    fn new(command: &mut Command) -> Result<Self> {
+        let output = NamedTempFile::new().context("create temporary Cargo output file")?;
+        let (reader, writer) = std::io::pipe().context("create Cargo output pipe")?;
+        command.stdout(
+            writer
+                .try_clone()
+                .context("duplicate Cargo output pipe for stdout")?,
+        );
+        command.stderr(writer);
+        Ok(Self { output, reader })
+    }
+
+    /// Drains output while Cargo runs, then closes the reader before returning the captured bytes.
+    fn run(
+        mut self,
+        mut command: Command,
+        subcommand: &str,
+    ) -> Result<(ExitStatus, NamedTempFile)> {
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("run instrumented Cargo {subcommand}"))?;
+        drop(command);
+
+        let mut buffer = [0_u8; 16 * 1024];
+        let status = loop {
+            let status = child
+                .try_wait()
+                .with_context(|| format!("poll instrumented Cargo {subcommand}"))?;
+            let mut pending =
+                cargo_output_pending(&self.reader).context("inspect pending Cargo output")?;
+            while pending != 0 {
+                let requested = pending.min(buffer.len());
+                let read = self
+                    .reader
+                    .read(&mut buffer[..requested])
+                    .with_context(|| format!("read captured Cargo {subcommand} output"))?;
+                if read == 0 {
+                    bail!("Cargo output pipe closed while draining pending output");
+                }
+                self.output
+                    .as_file_mut()
+                    .write_all(&buffer[..read])
+                    .context("write temporary Cargo output file")?;
+                pending -= read;
+            }
+            if let Some(status) = status {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        drop(self.reader);
+        self.output
+            .as_file_mut()
+            .flush()
+            .context("flush temporary Cargo output file")?;
+        Ok((status, self.output))
+    }
+}
+
+/// Returns the bytes immediately readable from Cargo's pipe without waiting for inherited writers.
+#[cfg(unix)]
+fn cargo_output_pending(reader: &PipeReader) -> std::io::Result<usize> {
+    usize::try_from(rustix::io::ioctl_fionread(reader)?)
+        .map_err(|_| std::io::Error::other("pending Cargo output exceeds usize"))
+}
+
+/// Returns the bytes immediately readable from Cargo's pipe without waiting for inherited writers.
+#[cfg(windows)]
+#[expect(unsafe_code, reason = "Windows pipe inspection requires PeekNamedPipe")]
+fn cargo_output_pending(reader: &PipeReader) -> std::io::Result<usize> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA};
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let mut pending = 0_u32;
+    // SAFETY: the pipe handle is valid for the duration of this call, and all
+    // output pointers are either null or point to initialized local storage.
+    let result = unsafe {
+        PeekNamedPipe(
+            reader.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut pending,
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        let error = std::io::Error::last_os_error();
+        let code = error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok());
+        if matches!(code, Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA)) {
+            return Ok(0);
+        }
+        return Err(error);
+    }
+    usize::try_from(pending)
+        .map_err(|_| std::io::Error::other("pending Cargo output exceeds usize"))
 }
 
 struct CollectedFragments {
@@ -832,9 +1169,9 @@ impl InstrumentedCargo<'_> {
             .arg(self.args.color.cargo_value());
         feature_profile.configure_cargo(&mut command);
         self.toolchain.configure_command(&mut command)?;
-        if let Some(target) = &self.args.target {
-            command.arg("--target").arg(target);
-        }
+        command
+            .arg("--target")
+            .arg(self.args.target.as_deref().unwrap_or(self.toolchain.host()));
         if let Some(fix) = fix {
             if self.args.allow_dirty || fix.allow_dirty {
                 command.arg("--allow-dirty");
@@ -861,18 +1198,26 @@ impl InstrumentedCargo<'_> {
         if doctests {
             command
                 .arg("--quiet")
-                .stdout(Stdio::null())
                 .env("RUSTC_BOOTSTRAP", "1")
                 .env(
                     "CARGO_ENCODED_RUSTDOCFLAGS",
                     doctest_rustdoc_flags(self.driver),
                 )
                 .env_remove("RUSTDOCFLAGS");
+            if self.args.output_format == OutputFormat::Text {
+                command.stdout(Stdio::null());
+            }
         }
+        let cargo_output = if self.args.output_format == OutputFormat::Json {
+            Some(CargoOutputCapture::new(&mut command)?)
+        } else {
+            None
+        };
         Ok(ConfiguredCargoCommand {
             command,
             subcommand,
-            capture_output: doctests,
+            capture_output: doctests && self.args.output_format == OutputFormat::Text,
+            cargo_output,
         })
     }
 
@@ -887,8 +1232,22 @@ impl InstrumentedCargo<'_> {
             mut command,
             subcommand,
             capture_output,
+            cargo_output,
         } = self.command(run_id, graph_dir, invocation, feature_profile)?;
-        let status = if capture_output {
+        let status = if let Some(cargo_output) = cargo_output {
+            let (status, cargo_output) = cargo_output.run(command, subcommand)?;
+            let mut reader = cargo_output
+                .reopen()
+                .context("open temporary Cargo output file for reading")?;
+            match std::io::copy(&mut reader, &mut std::io::stderr()) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(error) => {
+                    return Err(error).context("write captured Cargo output to stderr");
+                }
+            }
+            status
+        } else if capture_output {
             let output = command
                 .output()
                 .with_context(|| format!("run instrumented Cargo {subcommand}"))?;
@@ -1306,6 +1665,7 @@ mod tests {
     use super::{
         Args, CargoInvocation, DEFAULT_TARGET_DIR_COMPONENT_MAX_BYTES, DiagnosticRenderer,
         LintLevel, LintLevels, ProductionSelection, default_target_dir, fix_plan_signature,
+        json_definition_kind, json_finding_kind,
     };
 
     fn render_diagnostic(finding: &Finding<'_>) -> String {
@@ -1555,6 +1915,46 @@ mod tests {
     }
 
     #[test]
+    fn json_schema_uses_stable_kind_names() {
+        assert_eq!(json_finding_kind(FindingKind::DeadPublic), "dead_public");
+        assert_eq!(
+            json_finding_kind(FindingKind::UnnecessaryPublic),
+            "unnecessary_public"
+        );
+        assert_eq!(
+            json_finding_kind(FindingKind::UnnecessaryRestrictedVisibility),
+            "unnecessary_restricted_visibility"
+        );
+        assert_eq!(
+            json_finding_kind(FindingKind::UnnecessaryCrateVisibility),
+            "unnecessary_crate_visibility"
+        );
+
+        for (kind, expected) in [
+            (DefinitionKind::Function, "function"),
+            (DefinitionKind::InherentMethod, "inherent_method"),
+            (
+                DefinitionKind::InherentAssociatedConstant,
+                "inherent_associated_constant",
+            ),
+            (DefinitionKind::Trait, "trait"),
+            (DefinitionKind::Struct, "struct"),
+            (DefinitionKind::Enum, "enum"),
+            (DefinitionKind::Union, "union"),
+            (DefinitionKind::TypeAlias, "type_alias"),
+            (DefinitionKind::Constant, "constant"),
+            (DefinitionKind::Static, "static"),
+            (DefinitionKind::Field, "field"),
+            (DefinitionKind::EnumVariant, "enum_variant"),
+            (DefinitionKind::Reexport, "reexport"),
+            (DefinitionKind::Module, "module"),
+            (DefinitionKind::Other, "other"),
+        ] {
+            assert_eq!(json_definition_kind(kind), expected);
+        }
+    }
+
+    #[test]
     fn diagnostic_rendering_includes_terminal_styles() {
         let definition = Definition {
             id: test_id("internal_helper"),
@@ -1566,6 +1966,7 @@ mod tests {
                 line: 5,
                 column: 1,
             }),
+            declaration_span: None,
             expansion_span: None,
             public_api: true,
             restricted_visible_api: false,
@@ -1607,6 +2008,7 @@ mod tests {
                 line: 7,
                 column: 5,
             }),
+            declaration_span: None,
             expansion_span: None,
             public_api: false,
             restricted_visible_api: true,
@@ -1647,6 +2049,7 @@ mod tests {
                 line: 16,
                 column: 5,
             }),
+            declaration_span: None,
             expansion_span: None,
             public_api: false,
             restricted_visible_api: true,
@@ -1683,6 +2086,7 @@ mod tests {
             name: "InternalState::Active".into(),
             kind: DefinitionKind::EnumVariant,
             span: None,
+            declaration_span: None,
             expansion_span: None,
             public_api: true,
             restricted_visible_api: false,
