@@ -11,11 +11,13 @@ use std::time::Duration;
 
 use anstyle::Style;
 use anyhow::{Context, Result, bail};
-use cargo_metadata::{MetadataCommand, TargetKind};
+use cargo_metadata::{DependencyKind, MetadataCommand, Target, TargetKind};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use tempfile::NamedTempFile;
 
-use crate::config::{AnalysisTarget, Config, ConfigDiagnosticKind, FeatureProfile};
+use crate::config::{
+    AnalysisTarget, Config, ConfigDiagnosticKind, FeatureProfile, ProductionProduct,
+};
 use crate::diagnostics::{DiagnosticRenderer, EMPHASIS, ERROR, WARNING, styled};
 use crate::protocol;
 use crate::toolchain::{
@@ -30,7 +32,7 @@ use cargo_hawk_internal::graph::{
 #[command(
     name = "cargo hawk",
     bin_name = "cargo hawk",
-    about = "Find unnecessary public surface in a Cargo binary product",
+    about = "Find unnecessary public surface in a Cargo workspace product",
     version
 )]
 struct Args {
@@ -334,8 +336,6 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         .no_deps()
         .exec()
         .with_context(|| format!("read Cargo metadata from {}", args.manifest_path.display()))?;
-    let candidate_crates = workspace_library_crates(&metadata)?;
-    validate_excluded_crates(&args.excluded_crates, &candidate_crates)?;
 
     let workspace_root = metadata.workspace_root.clone().into_std_path_buf();
     let manifest_path = args
@@ -360,7 +360,7 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         let config_path = config
             .path()
             .expect("configured production consumer has a configuration path");
-        validate_product(&metadata, &consumer.package, &consumer.binary).with_context(|| {
+        validate_product(&metadata, &consumer.package, &consumer.product).with_context(|| {
             format!(
                 "validate production consumer in {}:{}:{}: {}",
                 config_path.display(),
@@ -369,13 +369,12 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
                 consumer.reason
             )
         })?;
-        if !production_products
-            .iter()
-            .any(|product| product.package == consumer.package && product.binary == consumer.binary)
-        {
+        if !production_products.iter().any(|product| {
+            product.package == consumer.package && product.product == &consumer.product
+        }) {
             production_products.push(ProductionSelection {
                 package: &consumer.package,
-                binary: &consumer.binary,
+                product: &consumer.product,
             });
         }
     }
@@ -385,10 +384,22 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| workspace_root.join("hawk.toml"));
         bail!(
-            "no applicable production binaries configured in {}; add a `[[production]]` entry",
+            "no applicable production targets configured in {}; add a `[[production]]` entry",
             config_path.display()
         );
     }
+    let audited_library_crates = production_products
+        .iter()
+        .all(|product| matches!(product.product, ProductionProduct::Library(_)))
+        .then(|| {
+            production_products
+                .iter()
+                .map(|product| product.product.name().replace('-', "_"))
+                .collect::<HashSet<_>>()
+        });
+    let workspace_crates = workspace_library_crates(&metadata, audited_library_crates.as_ref())?;
+    validate_excluded_crates(&args.excluded_crates, &workspace_crates)?;
+    let candidate_crates = audited_library_crates.unwrap_or(workspace_crates);
     let doctest_packages = config
         .doctest_packages()
         .map(|packages| {
@@ -445,6 +456,25 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         .into_owned();
     let mut profile_graphs = Vec::new();
     for (index, feature_profile) in config.feature_profiles().iter().enumerate() {
+        let mut metadata_command = MetadataCommand::new();
+        metadata_command
+            .current_dir(&workspace_root)
+            .manifest_path(&manifest_path)
+            .other_options(vec![
+                "--locked".to_owned(),
+                "--filter-platform".to_owned(),
+                args.target
+                    .as_deref()
+                    .unwrap_or(toolchain.host())
+                    .to_owned(),
+            ]);
+        feature_profile.configure_metadata(&mut metadata_command);
+        let resolved_metadata = metadata_command.exec().with_context(|| {
+            format!(
+                "resolve Cargo dependencies for feature profile `{}`",
+                feature_profile.name()
+            )
+        })?;
         let profile_graph_dir = graph_dir
             .join("feature-profiles")
             .join(format!("{index}-{}", feature_profile.name()));
@@ -467,11 +497,21 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
             run_id: format!("{run_id}-feature-profile-{index}"),
             production_dir,
             non_production_dir,
+            production_consumer_packages: production_workspace_packages(
+                &resolved_metadata,
+                &production_products,
+                &analysis_target,
+            )?,
         });
     }
 
     let driver = driver_executable()?;
     validate_driver_protocol(&driver, &toolchain)?;
+    let workspace_library_sources = workspace_library_sources(&metadata);
+    let workspace_library_source_paths = workspace_library_sources
+        .values()
+        .map(|source| source.path.clone())
+        .collect();
     let cargo = InstrumentedCargo {
         args: &args,
         workspace_root: &workspace_root,
@@ -486,6 +526,8 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
             CollectionOptions::new(config.preserve_uniform_field_visibility())
         },
         doctest_packages: doctest_packages.as_deref(),
+        workspace_library_sources,
+        workspace_library_source_paths,
     };
     let mut production_fragments = Vec::new();
     let mut test_fragments = Vec::new();
@@ -507,6 +549,7 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
                 &analysis_target,
                 &production_fragments,
                 &test_fragments,
+                &candidate_crates,
                 analyze_with_options(
                     &production_fragments,
                     &test_fragments,
@@ -617,6 +660,7 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         &analysis_target,
         &production_fragments,
         &test_fragments,
+        &candidate_crates,
         analyze_with_options(
             &production_fragments,
             &test_fragments,
@@ -640,9 +684,15 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         definition_packages(&production_fragments, &test_fragments, &emitted_finding_ids);
     let mut has_denied_diagnostic = false;
     let production_description = if production_products.len() == 1 {
-        format!("binary `{}`", production_products[0].binary)
-    } else {
+        let product = production_products[0].product;
+        format!("{} `{}`", product.kind().as_str(), product.name())
+    } else if production_products
+        .iter()
+        .all(|product| matches!(product.product, ProductionProduct::Binary(_)))
+    {
         "the configured production binaries".to_owned()
+    } else {
+        "the configured production targets".to_owned()
     };
     for finding in &findings.findings {
         if args.only.is_some_and(|only| !only.includes(finding.kind)) {
@@ -715,16 +765,22 @@ pub(crate) fn run(mut raw_args: Vec<String>) -> Result<ExitCode> {
         }
         OutputFormat::Json => {
             let output = serde_json::json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "summary": {
                     "diagnostic_count": diagnostic_count,
                     "target": args.target.as_deref().unwrap_or(toolchain.host()),
                     "production": production_products
                         .iter()
-                        .map(|product| serde_json::json!({
-                            "package": product.package,
-                            "binary": product.binary,
-                        }))
+                        .map(|product| match product.product {
+                            ProductionProduct::Binary(binary) => serde_json::json!({
+                                "package": product.package,
+                                "binary": binary,
+                            }),
+                            ProductionProduct::Library(library) => serde_json::json!({
+                                "package": product.package,
+                                "library": library,
+                            }),
+                        })
                         .collect::<Vec<_>>(),
                     "feature_profiles": config
                         .feature_profiles()
@@ -929,12 +985,20 @@ struct InstrumentedCargo<'a> {
     toolchain: &'a RustToolchain,
     collection_options: CollectionOptions,
     doctest_packages: Option<&'a [String]>,
+    workspace_library_sources: HashMap<String, WorkspaceLibrarySource>,
+    workspace_library_source_paths: HashSet<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceLibrarySource {
+    crate_name: String,
+    path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProductionSelection<'a> {
     package: &'a str,
-    binary: &'a str,
+    product: &'a ProductionProduct,
 }
 
 struct FeatureProfileGraph<'a> {
@@ -942,6 +1006,7 @@ struct FeatureProfileGraph<'a> {
     run_id: String,
     production_dir: PathBuf,
     non_production_dir: PathBuf,
+    production_consumer_packages: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1104,14 +1169,19 @@ impl<'a> CargoInvocation<'a> {
         match self {
             Self::CheckProduction(product) => CargoInvocationSpec {
                 subcommand: "check",
-                selection_arguments: vec![
+                selection_arguments: [
                     "--package".into(),
                     product.package.into(),
-                    "--bin".into(),
-                    product.binary.into(),
-                ],
+                    product.product.cargo_flag().into(),
+                ]
+                .into_iter()
+                .chain(
+                    matches!(product.product, ProductionProduct::Binary(_))
+                        .then(|| product.product.name().into()),
+                )
+                .collect(),
                 consumer_mode: protocol::ConsumerMode::Production,
-                root_crate: product.binary.replace('-', "_"),
+                root_crate: product.product.name().replace('-', "_"),
                 fix: None,
                 doctests: false,
             },
@@ -1312,10 +1382,11 @@ impl InstrumentedCargo<'_> {
         production_graph_dir: &Path,
         non_production_graph_dir: &Path,
         feature_profile: &FeatureProfile,
+        production_consumer_packages: &HashSet<String>,
     ) -> Result<CollectedFragments> {
         // Every production product uses the same compiler mode and feature set. Reuse one
         // dependency fingerprint across the product builds so Cargo can retain fragments from
-        // shared dependencies instead of compiling them once per configured binary.
+        // shared dependencies instead of compiling them once per configured target.
         let production_run_id = format!("{run_id}-production");
         for product in production_products.iter().copied() {
             self.run(
@@ -1340,11 +1411,114 @@ impl InstrumentedCargo<'_> {
             feature_profile,
         )?;
 
+        let mut production = read_fragments(production_graph_dir)?;
+        let mut non_production = read_fragments(non_production_graph_dir)?;
+        for fragment in &mut non_production {
+            classify_non_production_target(
+                fragment,
+                &self.workspace_library_sources,
+                &self.workspace_library_source_paths,
+                self.workspace_root,
+            );
+        }
+        for fragment in production.iter_mut().chain(&mut non_production) {
+            if !production_consumer_packages.contains(&fragment.package_name) {
+                fragment.non_production_consumer = true;
+            }
+        }
+        for product in production_products {
+            let ProductionProduct::Library(library) = product.product else {
+                continue;
+            };
+            let crate_name = library.replace('-', "_");
+            let mut found = false;
+            for fragment in production.iter_mut().filter(|fragment| {
+                fragment.package_name == product.package
+                    && fragment.crate_name == crate_name
+                    && fragment.compilation_target
+                        == self.args.target.as_deref().unwrap_or(self.toolchain.host())
+                    && fragment.product_root_kind != Some(protocol::ProductionTargetKind::Binary)
+            }) {
+                // Other products can compile this library with different feature sets before
+                // Cargo checks the selected product itself. Retain every matching variant.
+                fragment.is_product_root = true;
+                fragment.product_root_kind = Some(protocol::ProductionTargetKind::Library);
+                found = true;
+            }
+            if !found {
+                bail!(
+                    "no instrumented fragment was emitted for configured library `{}` in package `{}`",
+                    library,
+                    product.package
+                );
+            }
+        }
+
         Ok(CollectedFragments {
-            production: read_fragments(production_graph_dir)?,
-            non_production: read_fragments(non_production_graph_dir)?,
+            production,
+            non_production,
         })
     }
+}
+
+fn classify_non_production_target(
+    fragment: &mut Fragment,
+    workspace_library_sources: &HashMap<String, WorkspaceLibrarySource>,
+    workspace_library_source_paths: &HashSet<PathBuf>,
+    workspace_root: &Path,
+) {
+    if fragment.is_product_root || fragment.test_surface {
+        return;
+    }
+
+    let Some(crate_root) = fragment.crate_root.as_deref().map(Path::new) else {
+        return;
+    };
+    let crate_root = if crate_root.is_absolute() {
+        crate_root.to_path_buf()
+    } else {
+        workspace_root.join(crate_root)
+    };
+    let crate_root = normalize_workspace_source_path(&crate_root);
+    let library_source = workspace_library_sources.get(&fragment.package_name);
+    if library_source
+        .is_some_and(|source| source.crate_name == fragment.crate_name && source.path == crate_root)
+    {
+        return;
+    }
+
+    // Rustdoc bundles and library-format examples are library-shaped compiler
+    // invocations, but they are not the owning package's production library.
+    fragment.is_product_root = true;
+    fragment.non_production_consumer = true;
+    if !workspace_library_source_paths.contains(&crate_root) {
+        // An example can intentionally share its source file with the package
+        // library. Rooting its exports would also root their equivalent library
+        // declarations, making genuinely dead APIs appear test-live.
+        fragment.roots.extend(
+            fragment
+                .definitions
+                .iter()
+                .filter(|definition| definition.public_api)
+                .map(|definition| definition.id),
+        );
+        fragment.roots.sort();
+        fragment.roots.dedup();
+    }
+}
+
+fn normalize_workspace_source_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn collect_profile_fragments(
@@ -1362,13 +1536,14 @@ fn collect_profile_fragments(
         &profile_graph.production_dir,
         &profile_graph.non_production_dir,
         profile_graph.feature_profile,
+        &profile_graph.production_consumer_packages,
     )?;
     if !production_fragments
         .iter()
         .any(|fragment| fragment.is_product_root)
     {
         bail!(
-            "no instrumented fragment was emitted for a configured production binary under feature profile `{}`; rerun with a fresh --target-dir",
+            "no instrumented fragment was emitted for a configured production target under feature profile `{}`; rerun with a fresh --target-dir",
             profile_graph.feature_profile.name()
         );
     }
@@ -1385,20 +1560,42 @@ fn production_summary(
             let cargo_arguments = feature_profiles[0].cargo_arguments_description();
             let separator = if cargo_arguments.is_empty() { "" } else { " " };
             return format!(
-                "`{} --bin {}{separator}{cargo_arguments}`",
-                product.package, product.binary
+                "`{} {}{}{separator}{cargo_arguments}`",
+                product.package,
+                product.product.cargo_flag(),
+                match product.product {
+                    ProductionProduct::Binary(binary) => format!(" {binary}"),
+                    ProductionProduct::Library(_) => String::new(),
+                }
             );
         }
         return format!(
-            "`{} --bin {}` across {} feature profiles",
+            "`{} {}{}` across {} feature profiles",
             product.package,
-            product.binary,
+            product.product.cargo_flag(),
+            match product.product {
+                ProductionProduct::Binary(binary) => format!(" {binary}"),
+                ProductionProduct::Library(_) => String::new(),
+            },
             feature_profiles.len()
         );
     }
 
+    let product_kind = if production_products
+        .iter()
+        .all(|product| matches!(product.product, ProductionProduct::Binary(_)))
+    {
+        "binaries"
+    } else if production_products
+        .iter()
+        .all(|product| matches!(product.product, ProductionProduct::Library(_)))
+    {
+        "libraries"
+    } else {
+        "targets"
+    };
     let summary = format!(
-        "{} configured production binaries",
+        "{} configured production {product_kind}",
         production_products.len()
     );
     if feature_profiles.len() == 1 {
@@ -1552,9 +1749,7 @@ fn fix_packages(metadata: &cargo_metadata::Metadata, fix_plan: &FixPlan) -> Resu
     let mut packages = Vec::new();
     for package in &metadata.packages {
         for target in &package.targets {
-            if target.kind.contains(&TargetKind::Lib)
-                && remaining.remove(&target.name.replace('-', "_"))
-            {
+            if is_library_target(target) && remaining.remove(&target.name.replace('-', "_")) {
                 packages.push(package.name.to_string());
             }
         }
@@ -1568,11 +1763,48 @@ fn fix_packages(metadata: &cargo_metadata::Metadata, fix_plan: &FixPlan) -> Resu
     Ok(packages)
 }
 
-fn workspace_library_crates(metadata: &cargo_metadata::Metadata) -> Result<HashSet<String>> {
+fn is_library_target(target: &Target) -> bool {
+    target.kind.iter().any(|kind| {
+        matches!(
+            kind,
+            TargetKind::Lib
+                | TargetKind::RLib
+                | TargetKind::DyLib
+                | TargetKind::CDyLib
+                | TargetKind::StaticLib
+        )
+    })
+}
+
+fn workspace_library_sources(
+    metadata: &cargo_metadata::Metadata,
+) -> HashMap<String, WorkspaceLibrarySource> {
+    metadata
+        .workspace_packages()
+        .into_iter()
+        .filter_map(|package| {
+            let target = package.targets.iter().find(|target| {
+                is_library_target(target) || target.kind.contains(&TargetKind::ProcMacro)
+            })?;
+            Some((
+                package.name.to_string(),
+                WorkspaceLibrarySource {
+                    crate_name: target.name.replace('-', "_"),
+                    path: normalize_workspace_source_path(target.src_path.as_std_path()),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn workspace_library_crates(
+    metadata: &cargo_metadata::Metadata,
+    audited_crates: Option<&HashSet<String>>,
+) -> Result<HashSet<String>> {
     let mut packages_by_crate: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for package in metadata.workspace_packages() {
         for target in &package.targets {
-            if target.kind.contains(&TargetKind::Lib) {
+            if is_library_target(target) {
                 packages_by_crate
                     .entry(target.name.replace('-', "_"))
                     .or_default()
@@ -1583,7 +1815,10 @@ fn workspace_library_crates(metadata: &cargo_metadata::Metadata) -> Result<HashS
 
     let conflicts = packages_by_crate
         .iter()
-        .filter(|(_, packages)| packages.len() > 1)
+        .filter(|(crate_name, packages)| {
+            packages.len() > 1
+                && audited_crates.is_none_or(|audited_crates| audited_crates.contains(*crate_name))
+        })
         .map(|(crate_name, packages)| {
             format!(
                 "`{crate_name}` ({})",
@@ -1603,6 +1838,148 @@ fn workspace_library_crates(metadata: &cargo_metadata::Metadata) -> Result<HashS
     }
 
     Ok(packages_by_crate.into_keys().collect())
+}
+
+fn production_workspace_packages(
+    metadata: &cargo_metadata::Metadata,
+    production_products: &[ProductionSelection<'_>],
+    analysis_target: &AnalysisTarget,
+) -> Result<HashSet<String>> {
+    let workspace_packages = metadata.workspace_packages();
+    let packages: HashMap<_, _> = workspace_packages
+        .iter()
+        .map(|package| (&package.id, package.name.as_str()))
+        .collect();
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .context("Cargo metadata did not contain a resolved dependency graph")?;
+    let mut dependencies: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut incoming: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut non_production_incoming: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut normal_dependencies: HashMap<&str, Vec<&str>> = HashMap::new();
+    for node in &resolve.nodes {
+        let Some(&package) = packages.get(&node.id) else {
+            continue;
+        };
+        for dependency in &node.deps {
+            let Some(&dependency_package) = packages.get(&dependency.pkg) else {
+                continue;
+            };
+            let mut applicable = dependency.dep_kinds.iter().filter(|kind| {
+                kind.target
+                    .as_ref()
+                    .is_none_or(|platform| analysis_target.matches_platform(platform))
+            });
+            let Some(first_kind) = applicable.next() else {
+                continue;
+            };
+            dependencies
+                .entry(package)
+                .or_default()
+                .push(dependency_package);
+            incoming
+                .entry(dependency_package)
+                .or_default()
+                .push(package);
+            if first_kind.kind == DependencyKind::Normal
+                || applicable.any(|kind| kind.kind == DependencyKind::Normal)
+            {
+                normal_dependencies
+                    .entry(package)
+                    .or_default()
+                    .push(dependency_package);
+            } else {
+                non_production_incoming
+                    .entry(dependency_package)
+                    .or_default()
+                    .push(package);
+            }
+        }
+    }
+
+    let mut visited = HashSet::new();
+    let mut ordered = Vec::with_capacity(packages.len());
+    for package in packages.values().copied() {
+        let mut pending = vec![(package, false)];
+        while let Some((package, expanded)) = pending.pop() {
+            if expanded {
+                ordered.push(package);
+            } else if visited.insert(package) {
+                pending.push((package, true));
+                if let Some(dependencies) = dependencies.get(package) {
+                    pending.extend(dependencies.iter().map(|dependency| (*dependency, false)));
+                }
+            }
+        }
+    }
+
+    let mut components: Vec<Vec<&str>> = Vec::new();
+    let mut component_by_package = HashMap::new();
+    while let Some(package) = ordered.pop() {
+        if component_by_package.contains_key(package) {
+            continue;
+        }
+        let component_index = components.len();
+        let mut component = Vec::new();
+        let mut pending = vec![package];
+        while let Some(package) = pending.pop() {
+            if component_by_package.contains_key(package) {
+                continue;
+            }
+            component_by_package.insert(package, component_index);
+            component.push(package);
+            if let Some(dependents) = incoming.get(package) {
+                pending.extend(dependents);
+            }
+        }
+        components.push(component);
+    }
+
+    let mut root_components = vec![true; components.len()];
+    for (&package, dependents) in &incoming {
+        let component = component_by_package[package];
+        if dependents
+            .iter()
+            .any(|dependent| component_by_package[dependent] != component)
+        {
+            root_components[component] = false;
+        }
+    }
+
+    let mut pending: Vec<&str> = components
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| root_components[*index])
+        .flat_map(|(index, component)| {
+            // A dev-dependency cycle has no package with zero incoming edges.
+            // Start outside its dev/build-only edges so fixtures remain non-production.
+            let roots: Vec<_> = component
+                .iter()
+                .copied()
+                .filter(|package| {
+                    non_production_incoming
+                        .get(package)
+                        .is_none_or(|dependents| {
+                            dependents
+                                .iter()
+                                .all(|dependent| component_by_package[dependent] != index)
+                        })
+                })
+                .collect();
+            if roots.is_empty() { component } else { roots }
+        })
+        .chain(production_products.iter().map(|product| product.package))
+        .collect();
+    let mut production_packages = HashSet::new();
+    while let Some(package) = pending.pop() {
+        if production_packages.insert(package.to_owned())
+            && let Some(dependencies) = normal_dependencies.get(package)
+        {
+            pending.extend(dependencies);
+        }
+    }
+    Ok(production_packages)
 }
 
 fn validate_excluded_crates(
@@ -1646,15 +2023,22 @@ fn validate_excluded_crates(
 fn validate_product(
     metadata: &cargo_metadata::Metadata,
     package: &str,
-    binary: &str,
+    product: &ProductionProduct,
 ) -> Result<()> {
     let package = workspace_package(metadata, package)?;
-    if !package
-        .targets
-        .iter()
-        .any(|target| target.name == binary && target.kind.contains(&TargetKind::Bin))
-    {
-        bail!("package `{}` has no binary target `{binary}`", package.name);
+    if !package.targets.iter().any(|target| {
+        target.name == product.name()
+            && match product {
+                ProductionProduct::Binary(_) => target.kind.contains(&TargetKind::Bin),
+                ProductionProduct::Library(_) => is_library_target(target),
+            }
+    }) {
+        bail!(
+            "package `{}` has no {} target `{}`",
+            package.name,
+            product.kind().as_str(),
+            product.name()
+        );
     }
     Ok(())
 }
@@ -1738,7 +2122,7 @@ fn clear_fragments(graph_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -1760,7 +2144,8 @@ mod tests {
 
     use super::{
         Args, CargoInvocation, DEFAULT_TARGET_DIR_COMPONENT_MAX_BYTES, DiagnosticRenderer,
-        LintLevel, LintLevels, ProductionSelection, default_target_dir, definition_packages,
+        LintLevel, LintLevels, ProductionProduct, ProductionSelection, WorkspaceLibrarySource,
+        classify_non_production_target, default_target_dir, definition_packages,
         fix_plan_signature, json_definition_kind, json_finding_kind, validate_excluded_crates,
     };
 
@@ -1940,10 +2325,13 @@ mod tests {
             protocol_version: crate::protocol::ProtocolVersion,
             package_name: package_name.into(),
             crate_name: "renamed_library".into(),
+            compilation_target: "aarch64-apple-darwin".into(),
             crate_id: test_id(package_name),
             crate_root: None,
             is_product_root: false,
+            product_root_kind: None,
             test_surface: false,
+            non_production_consumer: false,
             definitions,
             edges: vec![],
             roots: vec![],
@@ -1984,6 +2372,121 @@ mod tests {
     }
 
     #[test]
+    fn non_production_library_targets_are_classified_by_their_source_paths() {
+        let sources = HashMap::from([
+            (
+                "consumer".to_owned(),
+                WorkspaceLibrarySource {
+                    crate_name: "consumer".to_owned(),
+                    path: PathBuf::from("/workspace/consumer/src/lib.rs"),
+                },
+            ),
+            (
+                "api".to_owned(),
+                WorkspaceLibrarySource {
+                    crate_name: "api".to_owned(),
+                    path: PathBuf::from("/workspace/api/src/lib.rs"),
+                },
+            ),
+        ]);
+        let library_paths = sources.values().map(|source| source.path.clone()).collect();
+        let definition = Definition {
+            id: test_id("non-production-entry"),
+            crate_name: "consumer".into(),
+            name: "entry".into(),
+            kind: DefinitionKind::Function,
+            span: None,
+            declaration_span: None,
+            expansion_span: None,
+            public_api: true,
+            restricted_visible_api: false,
+            crate_visible_api: false,
+            visible_reexport_api: false,
+            module_scope: vec![],
+            uniform_field_group: None,
+            dead_code_allowed: false,
+        };
+        let fragment = |crate_root: &str| Fragment {
+            protocol_version: crate::protocol::ProtocolVersion,
+            package_name: "consumer".into(),
+            crate_name: "consumer".into(),
+            compilation_target: "aarch64-apple-darwin".into(),
+            crate_id: test_id("consumer"),
+            crate_root: Some(crate_root.into()),
+            is_product_root: false,
+            product_root_kind: None,
+            test_surface: false,
+            non_production_consumer: false,
+            definitions: vec![definition.clone()],
+            edges: vec![],
+            roots: vec![],
+            conservative_roots: vec![],
+            required_public_roots: vec![],
+        };
+
+        let mut library = fragment("consumer/src/lib.rs");
+        classify_non_production_target(
+            &mut library,
+            &sources,
+            &library_paths,
+            Path::new("/workspace"),
+        );
+        assert!(!library.is_product_root);
+        assert!(!library.non_production_consumer);
+        assert!(library.roots.is_empty());
+
+        let mut normalized_library = fragment("consumer/src/../src/./lib.rs");
+        classify_non_production_target(
+            &mut normalized_library,
+            &sources,
+            &library_paths,
+            Path::new("/workspace"),
+        );
+        assert!(!normalized_library.is_product_root);
+        assert!(!normalized_library.non_production_consumer);
+
+        let mut same_source_example = fragment("consumer/src/lib.rs");
+        same_source_example.crate_name = "example_library".into();
+        classify_non_production_target(
+            &mut same_source_example,
+            &sources,
+            &library_paths,
+            Path::new("/workspace"),
+        );
+        assert!(same_source_example.is_product_root);
+        assert!(same_source_example.non_production_consumer);
+        assert!(same_source_example.roots.is_empty());
+
+        let mut other_library_example = fragment("api/src/lib.rs");
+        other_library_example.crate_name = "api_example".into();
+        classify_non_production_target(
+            &mut other_library_example,
+            &sources,
+            &library_paths,
+            Path::new("/workspace"),
+        );
+        assert!(other_library_example.is_product_root);
+        assert!(other_library_example.non_production_consumer);
+        assert!(other_library_example.roots.is_empty());
+
+        for crate_root in [
+            "consumer/examples/library.rs",
+            "/tmp/rustdoctest/doctest_bundle_2024.rs",
+        ] {
+            let mut non_production = fragment(crate_root);
+            classify_non_production_target(
+                &mut non_production,
+                &sources,
+                &library_paths,
+                Path::new("/workspace"),
+            );
+            assert!(non_production.is_product_root);
+            assert!(non_production.non_production_consumer);
+            assert_eq!(non_production.roots, vec![test_id("non-production-entry")]);
+        }
+    }
+
+    #[test]
     fn diagnostic_renderer_loads_each_source_once() {
         let load_count = Cell::new(0);
         let mut renderer =
@@ -2010,16 +2513,30 @@ mod tests {
     fn cargo_invocations_encode_valid_subcommands_and_modes() {
         let packages = vec!["library".to_owned(), "support".to_owned()];
         let fix_plan = Path::new("fix-plan.json");
+        let binary = ProductionProduct::Binary("app-cli".to_owned());
+        let library = ProductionProduct::Library("public-api".to_owned());
 
         assert_cargo_invocation(
             CargoInvocation::CheckProduction(ProductionSelection {
                 package: "app-package",
-                binary: "app-cli",
+                product: &binary,
             }),
             "check",
             &["--package", "app-package", "--bin", "app-cli"],
             ConsumerMode::Production,
             "app_cli",
+            None,
+            false,
+        );
+        assert_cargo_invocation(
+            CargoInvocation::CheckProduction(ProductionSelection {
+                package: "api-package",
+                product: &library,
+            }),
+            "check",
+            &["--package", "api-package", "--lib"],
+            ConsumerMode::Production,
+            "public_api",
             None,
             false,
         );

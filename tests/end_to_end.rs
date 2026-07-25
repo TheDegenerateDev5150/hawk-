@@ -162,6 +162,61 @@ impl HawkTestContext {
     }
 }
 
+fn add_library_support_package(
+    context: &HawkTestContext,
+    support_dependencies: &str,
+    support_source: &str,
+) {
+    let workspace_manifest_path = context.workspace().join("Cargo.toml");
+    let workspace_manifest = fs::read_to_string(&workspace_manifest_path)
+        .expect("read workspace manifest")
+        .replace(
+            "members = [\"api\", \"consumer\"]",
+            "members = [\"api\", \"consumer\", \"support\"]",
+        );
+    fs::write(workspace_manifest_path, workspace_manifest).expect("add support package");
+
+    let support_source_path = context.workspace().join("support/src");
+    fs::create_dir_all(&support_source_path).expect("create support package");
+    fs::write(
+        context.workspace().join("support/Cargo.toml"),
+        format!(
+            "[package]\nname = \"support\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{support_dependencies}"
+        ),
+    )
+    .expect("write support manifest");
+    fs::write(support_source_path.join("lib.rs"), support_source).expect("write support source");
+
+    let consumer_manifest_path = context.workspace().join("consumer/Cargo.toml");
+    let mut consumer_manifest =
+        fs::read_to_string(&consumer_manifest_path).expect("read consumer manifest");
+    consumer_manifest.push_str("\n[dev-dependencies]\nsupport = { path = \"../support\" }\n");
+    fs::write(consumer_manifest_path, consumer_manifest).expect("add support dev dependency");
+
+    let consumer_source_path = context.workspace().join("consumer/src/lib.rs");
+    let mut consumer_source =
+        fs::read_to_string(&consumer_source_path).expect("read consumer source");
+    consumer_source.push_str(
+        "\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn uses_dev_support() {\n        support::fixture();\n    }\n}\n",
+    );
+    fs::write(consumer_source_path, consumer_source).expect("add support test");
+
+    regenerate_fixture_lockfile(context);
+}
+
+fn regenerate_fixture_lockfile(context: &HawkTestContext) {
+    let output = context
+        .cargo()
+        .args(["generate-lockfile", "--offline"])
+        .output()
+        .expect("regenerate fixture lockfile");
+    assert!(
+        output.status.success(),
+        "could not regenerate fixture lockfile:\n{}",
+        context.normalized_stderr(&output)
+    );
+}
+
 #[test]
 fn test_context_normalizes_canonical_paths() {
     let context = HawkTestContext::new("basic");
@@ -351,6 +406,59 @@ fn resolves_relative_target_directory_from_the_launch_directory() {
     context.assert_success(&output);
     assert!(launch_directory.path().join("target/debug").is_dir());
     assert!(!context.workspace().join("target").exists());
+}
+
+#[test]
+fn resolves_workspace_cargo_configuration_from_an_external_launch_directory() {
+    let context = HawkTestContext::new("basic");
+    let patched_dependency = tempfile::tempdir().expect("temporary patched dependency");
+    fs::create_dir(patched_dependency.path().join("src")).expect("create patched dependency");
+    fs::write(
+        patched_dependency.path().join("Cargo.toml"),
+        "[package]\nname = \"hawk-metadata-config-support\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write patched dependency manifest");
+    fs::write(
+        patched_dependency.path().join("src/lib.rs"),
+        "pub fn fixture() {}\n",
+    )
+    .expect("write patched dependency source");
+
+    let app_manifest_path = context.workspace().join("app/Cargo.toml");
+    let app_manifest = fs::read_to_string(&app_manifest_path)
+        .expect("read app manifest")
+        .replace(
+            "[dependencies]\n",
+            "[dependencies]\nhawk-metadata-config-support = \"0.1.0\"\n",
+        );
+    fs::write(app_manifest_path, app_manifest).expect("add patched dependency");
+
+    let cargo_config = context.workspace().join(".cargo");
+    fs::create_dir(&cargo_config).expect("create Cargo configuration directory");
+    fs::write(
+        cargo_config.join("config.toml"),
+        format!(
+            "[patch.crates-io]\nhawk-metadata-config-support = {{ path = \"{}\" }}\n",
+            patched_dependency
+                .path()
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        ),
+    )
+    .expect("write Cargo dependency patch configuration");
+    regenerate_fixture_lockfile(&context);
+
+    let launch_directory = tempfile::tempdir().expect("temporary launch directory");
+    let output = context
+        .command()
+        .current_dir(launch_directory.path())
+        .arg("-A")
+        .arg("warnings")
+        .output()
+        .expect("run cargo-hawk outside its configured workspace");
+
+    context.assert_success(&output);
 }
 
 #[test]
@@ -783,6 +891,1034 @@ fn production_binary_named_like_a_library_does_not_suppress_its_findings() {
 }
 
 #[test]
+fn library_production_targets_audit_actual_workspace_uses() {
+    let context = HawkTestContext::new("library_products");
+    let output = context.run(&[]);
+
+    context.assert_success(&output);
+    let stdout = context.normalized_stdout(&output);
+    assert!(
+        stdout.contains("warning[hawk::dead_public]: `unused` is public"),
+        "unused library export was not diagnosed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("warning[hawk::unnecessary_public]: `used_only_within_crate` is public"),
+        "crate-local library export was not diagnosed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("`used_across_workspace`"),
+        "cross-crate workspace use was not preserved:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("`consume`"),
+        "unselected workspace consumer became a diagnostic target:\n{stdout}"
+    );
+    assert!(stdout.contains("`internal-api --lib --all-features`"));
+}
+
+#[test]
+fn library_production_targets_are_described_in_json_reports() {
+    let context = HawkTestContext::new("library_products");
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    assert_eq!(report["schema_version"], 4);
+    assert_eq!(
+        report["summary"]["production"],
+        serde_json::json!([{"package": "internal-api", "library": "internal_api"}])
+    );
+    assert_eq!(report["summary"]["diagnostic_count"], 2);
+}
+
+fn add_binary_production_product(context: &HawkTestContext) {
+    let consumer_manifest_path = context.workspace().join("consumer/Cargo.toml");
+    let mut consumer_manifest =
+        fs::read_to_string(&consumer_manifest_path).expect("read consumer manifest");
+    consumer_manifest.push_str("\n[[bin]]\nname = \"runner\"\npath = \"src/main.rs\"\n");
+    fs::write(consumer_manifest_path, consumer_manifest).expect("add configured binary target");
+    fs::write(
+        context.workspace().join("consumer/src/main.rs"),
+        "fn main() { internal_api::used_across_workspace(); }\n",
+    )
+    .expect("write configured binary target");
+
+    let configuration_path = context.workspace().join("hawk.toml");
+    let mut configuration =
+        fs::read_to_string(&configuration_path).expect("read production configuration");
+    configuration.push_str(
+        "\n[[production]]\npackage = \"consumer\"\nbin = \"runner\"\nreason = \"mixed binary and library product\"\n",
+    );
+    fs::write(configuration_path, configuration).expect("add binary production product");
+}
+
+fn assert_library_audit_ignores_same_named_integration_test(include_binary_product: bool) {
+    let context = HawkTestContext::new("library_products");
+    if include_binary_product {
+        add_binary_production_product(&context);
+    }
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\n#[cfg(test)]\npub fn library_test_helper() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn uses_library_test_helper() {\n        super::library_test_helper();\n    }\n}\n",
+    );
+    fs::write(&library_path, library).expect("add test-only library declaration");
+
+    let integration_path = context.workspace().join("api/tests/internal_api.rs");
+    fs::create_dir_all(
+        integration_path
+            .parent()
+            .expect("integration test directory"),
+    )
+    .expect("create integration test directory");
+    let integration_source = "pub fn integration_test_helper() {\n    internal_api::used_across_workspace();\n}\n\npub fn unused_integration_test_helper() {}\n\n#[test]\nfn exercises_public_api() {\n    integration_test_helper();\n}\n";
+    fs::write(&integration_path, integration_source).expect("add same-named integration test");
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| { diagnostic["location"]["file"] != "api/tests/internal_api.rs" }),
+        "same-named integration test expanded the library diagnostic surface: {report}"
+    );
+    let test_helper = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "library_test_helper")
+        .expect("library test-harness declaration remains a diagnostic candidate");
+    assert_eq!(test_helper["code"], "hawk::unnecessary_public");
+    assert_eq!(test_helper["test_only"], true);
+    assert_eq!(test_helper["test_compiled_only"], true);
+
+    let output = context.run(&["--fix", "--allow-no-vcs"]);
+
+    context.assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(&integration_path).expect("read integration test after fixing"),
+        integration_source,
+        "library-only fixing modified the same-named integration-test target"
+    );
+    let library = fs::read_to_string(library_path).expect("read fixed library source");
+    assert!(library.contains("fn library_test_helper()"));
+    assert!(!library.contains("pub fn library_test_helper()"));
+}
+
+#[test]
+fn library_production_targets_ignore_same_named_integration_tests() {
+    assert_library_audit_ignores_same_named_integration_test(false);
+}
+
+#[test]
+fn mixed_production_targets_ignore_same_named_integration_tests() {
+    assert_library_audit_ignores_same_named_integration_test(true);
+}
+
+#[test]
+fn mixed_products_audit_libraries_sharing_their_source_with_binary_products() {
+    let context = HawkTestContext::new("library_products");
+    let manifest_path = context.workspace().join("api/Cargo.toml");
+    let mut manifest = fs::read_to_string(&manifest_path).expect("read library manifest");
+    manifest.push_str("\n[[bin]]\nname = \"internal_api\"\npath = \"src/lib.rs\"\n");
+    fs::write(manifest_path, manifest).expect("add same-source binary target");
+
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read shared library source");
+    library.push_str(
+        "\nfn main() {\n    used_across_workspace();\n    crate_restricted_helper();\n}\n\npub(crate) fn crate_restricted_helper() {}\n",
+    );
+    fs::write(&library_path, library).expect("add shared binary entry point");
+
+    let configuration_path = context.workspace().join("hawk.toml");
+    let mut configuration =
+        fs::read_to_string(&configuration_path).expect("read production configuration");
+    configuration.push_str(
+        "\n[[production]]\npackage = \"internal-api\"\nbin = \"internal_api\"\nreason = \"binary and library products share one source file\"\n",
+    );
+    fs::write(configuration_path, configuration).expect("select same-source binary product");
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array");
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic["identity"]["item"] == "unused" && diagnostic["code"] == "hawk::dead_public"
+        }),
+        "a same-source binary product suppressed the selected library's dead public export: {report}"
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic["identity"]["item"] == "crate_restricted_helper"
+                && diagnostic["code"] == "hawk::unnecessary_restricted_visibility"
+        }),
+        "a same-source binary product suppressed the library's restricted export: {report}"
+    );
+
+    let output = context.run(&["--fix", "--allow-no-vcs"]);
+
+    context.assert_success(&output);
+    let library = fs::read_to_string(&library_path).expect("read fixed shared source");
+    assert!(library.contains("pub fn unused() {}"));
+    assert!(library.contains("fn used_only_within_crate() {}"));
+    assert!(!library.contains("pub fn used_only_within_crate() {}"));
+    assert!(library.contains("fn crate_restricted_helper() {}"));
+    assert!(!library.contains("pub(crate) fn crate_restricted_helper() {}"));
+}
+
+fn assert_library_audit_ignores_same_named_integration_test_overrides(
+    include_binary_product: bool,
+) {
+    let context = HawkTestContext::new("library_products");
+    if include_binary_product {
+        add_binary_production_product(&context);
+    }
+    let integration_path = context.workspace().join("api/tests/internal_api.rs");
+    fs::create_dir_all(
+        integration_path
+            .parent()
+            .expect("integration test directory"),
+    )
+    .expect("create integration test directory");
+    fs::write(
+        integration_path,
+        "pub fn integration_only() {}\n\n#[test]\nfn integration_test() {}\n",
+    )
+    .expect("add same-named integration test");
+
+    let configuration_path = context.workspace().join("hawk.toml");
+    let mut configuration =
+        fs::read_to_string(&configuration_path).expect("read production configuration");
+    configuration.push_str(
+        "\n[[override]]\nlint = \"hawk::dead_public\"\ncrate = \"internal_api\"\nitem = \"integration_only\"\nlevel = \"expect\"\nreason = \"integration targets are outside the library audit\"\n",
+    );
+    fs::write(configuration_path, configuration).expect("add integration-target override");
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "hawk::unknown_item"),
+        "an integration-test declaration was accepted as an audited library item: {report}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "hawk::unfulfilled_expectation"),
+        "an integration-test override became an unfulfilled library expectation: {report}"
+    );
+}
+
+#[test]
+fn library_production_targets_ignore_same_named_integration_test_overrides() {
+    assert_library_audit_ignores_same_named_integration_test_overrides(false);
+}
+
+#[test]
+fn mixed_production_targets_ignore_same_named_integration_test_overrides() {
+    assert_library_audit_ignores_same_named_integration_test_overrides(true);
+}
+
+#[test]
+fn library_production_targets_preserve_test_only_caller_classification() {
+    let context = HawkTestContext::new("library_products");
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\npub fn used_only_by_tests() {\n    used_only_within_tests();\n}\n\npub fn used_only_within_tests() {}\n",
+    );
+    fs::write(library_path, library).expect("add test-only library exports");
+    let consumer_path = context.workspace().join("consumer/src/lib.rs");
+    let mut consumer = fs::read_to_string(&consumer_path).expect("read consumer source");
+    consumer.push_str(
+        "\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn uses_library() {\n        internal_api::used_only_by_tests();\n    }\n}\n",
+    );
+    fs::write(consumer_path, consumer).expect("add test-only library caller");
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array")
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "used_only_within_tests")
+        .expect("test-only helper diagnostic");
+    assert_eq!(diagnostic["code"], "hawk::unnecessary_public");
+    assert_eq!(diagnostic["test_only"], true);
+}
+
+#[test]
+fn library_production_targets_report_public_callees_of_unreachable_private_code() {
+    let context = HawkTestContext::new("library_products");
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\nfn unreachable_private_caller() {\n    unreachable_public_callee();\n}\n\npub fn unreachable_public_callee() {}\n",
+    );
+    fs::write(library_path, library).expect("add unreachable library declarations");
+
+    let output = context.run(&["--only", "dead-public", "--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array")
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "unreachable_public_callee")
+        .expect("dead public callee diagnostic");
+    assert_eq!(diagnostic["code"], "hawk::dead_public");
+}
+
+#[test]
+fn library_production_targets_classify_example_callers_as_non_production() {
+    let context = HawkTestContext::new("library_products");
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\npub fn used_only_by_example() {\n    example_helper();\n}\n\npub fn example_helper() {}\n",
+    );
+    fs::write(library_path, library).expect("add example-only library exports");
+    let examples = context.workspace().join("consumer/examples");
+    fs::create_dir_all(&examples).expect("create consumer example directory");
+    fs::write(
+        examples.join("uses_api.rs"),
+        "fn main() { internal_api::used_only_by_example(); }\n",
+    )
+    .expect("write non-production library consumer");
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array")
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "example_helper")
+        .expect("example-only helper diagnostic");
+    assert_eq!(diagnostic["code"], "hawk::unnecessary_public");
+    assert_eq!(diagnostic["test_only"], true);
+}
+
+#[test]
+fn library_production_targets_classify_library_format_examples_as_non_production() {
+    let context = HawkTestContext::new("library_products");
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\npub fn used_only_by_library_example() {\n    library_example_helper();\n}\n\npub fn library_example_helper() {}\n",
+    );
+    fs::write(library_path, library).expect("add library-format example exports");
+
+    let manifest_path = context.workspace().join("consumer/Cargo.toml");
+    let mut manifest = fs::read_to_string(&manifest_path).expect("read consumer manifest");
+    manifest.push_str(
+        "\n[[example]]\nname = \"library_example\"\npath = \"examples/library_example.rs\"\ncrate-type = [\"rlib\"]\n",
+    );
+    fs::write(manifest_path, manifest).expect("add library-format example target");
+    let examples = context.workspace().join("consumer/examples");
+    fs::create_dir_all(&examples).expect("create consumer example directory");
+    fs::write(
+        examples.join("library_example.rs"),
+        "pub fn example_entry() { internal_api::used_only_by_library_example(); }\n",
+    )
+    .expect("write library-format example consumer");
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array")
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "library_example_helper")
+        .expect("library-format example helper diagnostic");
+    assert_eq!(diagnostic["code"], "hawk::unnecessary_public");
+    assert_eq!(diagnostic["test_only"], true);
+}
+
+#[test]
+fn library_production_targets_do_not_root_examples_sharing_workspace_library_sources() {
+    let context = HawkTestContext::new("library_products");
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let library = fs::read_to_string(&library_path).expect("read library source");
+    fs::write(
+        &library_path,
+        format!("#![deny(dead_code)]\n\n{library}\npub fn shared_source_dead_api() {{}}\n"),
+    )
+    .expect("add dead-code-denying shared library source");
+
+    let manifest_path = context.workspace().join("consumer/Cargo.toml");
+    let mut manifest = fs::read_to_string(&manifest_path).expect("read consumer manifest");
+    manifest.push_str(
+        "\n[[example]]\nname = \"mirrored_api\"\npath = \"../api/src/../src/lib.rs\"\ncrate-type = [\"rlib\"]\n",
+    );
+    fs::write(manifest_path, manifest).expect("add cross-package shared-source example");
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array")
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "shared_source_dead_api")
+        .expect("shared-source dead public export diagnostic");
+    assert_eq!(diagnostic["code"], "hawk::dead_public");
+    assert_eq!(diagnostic["test_only"], false);
+
+    let output = context.run(&["--fix", "--allow-no-vcs"]);
+
+    context.assert_success(&output);
+    let fixed_library = fs::read_to_string(library_path).expect("read fixed library source");
+    assert!(
+        fixed_library.contains("pub fn shared_source_dead_api()"),
+        "a shared-source example made --fix narrow a dead library export: {fixed_library}"
+    );
+}
+
+#[test]
+fn library_production_targets_classify_doctest_callers_as_non_production() {
+    let context = HawkTestContext::new("library_products");
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\npub fn used_only_by_doctest() {\n    doctest_helper();\n}\n\npub fn doctest_helper() {}\n",
+    );
+    fs::write(library_path, library).expect("add doctest-only library exports");
+    let consumer_path = context.workspace().join("consumer/src/lib.rs");
+    let mut consumer = fs::read_to_string(&consumer_path).expect("read consumer source");
+    consumer.push_str(
+        "\n/// ```\n/// internal_api::used_only_by_doctest();\n/// ```\npub fn documented() {}\n",
+    );
+    fs::write(consumer_path, consumer).expect("add doctest-only library caller");
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array")
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "doctest_helper")
+        .expect("doctest-only helper diagnostic");
+    assert_eq!(diagnostic["code"], "hawk::unnecessary_public");
+    assert_eq!(diagnostic["test_only"], true);
+}
+
+#[test]
+fn library_production_targets_classify_transitive_dev_dependencies_as_non_production() {
+    let context = HawkTestContext::new("library_products");
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\npub fn used_only_by_dev_support() {\n    dev_support_helper();\n}\n\npub fn dev_support_helper() {}\n",
+    );
+    fs::write(library_path, library).expect("add dev-only library exports");
+
+    add_library_support_package(
+        &context,
+        "internal-api = { path = \"../api\" }\n",
+        "pub fn fixture() { internal_api::used_only_by_dev_support(); }\n",
+    );
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array")
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "dev_support_helper")
+        .expect("dev-support-only helper diagnostic");
+    assert_eq!(diagnostic["code"], "hawk::unnecessary_public");
+    assert_eq!(diagnostic["test_only"], true);
+}
+
+#[test]
+fn library_production_targets_preserve_production_consumers_in_dev_dependency_cycles() {
+    let context = HawkTestContext::new("library_products");
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\npub fn used_only_by_dev_support() {\n    dev_support_helper();\n}\n\npub fn dev_support_helper() {}\n",
+    );
+    fs::write(library_path, library).expect("add dev-only library exports");
+    add_library_support_package(
+        &context,
+        "consumer = { path = \"../consumer\" }\ninternal-api = { path = \"../api\" }\n",
+        "pub fn fixture() { consumer::consume(); internal_api::used_only_by_dev_support(); }\n",
+    );
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array");
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["identity"]["item"] == "used_across_workspace"),
+        "a production consumer in a legal dev-dependency cycle was ignored: {report}"
+    );
+    let helper = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "used_only_within_crate")
+        .expect("production helper diagnostic");
+    assert_eq!(helper["code"], "hawk::unnecessary_public");
+    assert_eq!(helper["test_only"], false);
+    let dev_helper = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "dev_support_helper")
+        .expect("dev-support-only helper diagnostic");
+    assert_eq!(dev_helper["code"], "hawk::unnecessary_public");
+    assert_eq!(dev_helper["test_only"], true);
+}
+
+fn assert_production_consumer_in_reversed_dev_dependency_cycle(support_uses_api: bool) {
+    let context = HawkTestContext::new("library_products");
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\npub fn cycle_api() {\n    cycle_helper();\n}\n\npub fn cycle_helper() {}\n\npub fn support_api() {}\n",
+    );
+    fs::write(library_path, library).expect("add library exports for dependency cycle");
+
+    let (support_dependencies, support_source) = if support_uses_api {
+        (
+            "internal-api = { path = \"../api\" }\n",
+            "pub fn fixture() { internal_api::support_api(); }\n",
+        )
+    } else {
+        ("", "pub fn fixture() {}\n")
+    };
+    add_library_support_package(&context, support_dependencies, support_source);
+
+    let consumer_manifest_path = context.workspace().join("consumer/Cargo.toml");
+    let consumer_manifest = fs::read_to_string(&consumer_manifest_path)
+        .expect("read consumer manifest")
+        .replace(
+            "[dependencies]\n",
+            "[dependencies]\nsupport = { path = \"../support\" }\n",
+        )
+        .replace(
+            "\n[dev-dependencies]\nsupport = { path = \"../support\" }\n",
+            "\n",
+        );
+    fs::write(consumer_manifest_path, consumer_manifest)
+        .expect("move support to production dependencies");
+
+    let support_manifest_path = context.workspace().join("support/Cargo.toml");
+    let mut support_manifest =
+        fs::read_to_string(&support_manifest_path).expect("read support manifest");
+    support_manifest.push_str("\n[dev-dependencies]\nconsumer = { path = \"../consumer\" }\n");
+    fs::write(support_manifest_path, support_manifest)
+        .expect("add development dependency back to the consumer");
+
+    let consumer_source_path = context.workspace().join("consumer/src/lib.rs");
+    let consumer_source = fs::read_to_string(&consumer_source_path)
+        .expect("read consumer source")
+        .replace(
+            "internal_api::used_across_workspace();",
+            "internal_api::cycle_api();\n    support::fixture();",
+        );
+    fs::write(consumer_source_path, consumer_source)
+        .expect("add production use from the cyclic consumer");
+    regenerate_fixture_lockfile(&context);
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array");
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["identity"]["item"] == "cycle_api"),
+        "a production consumer in the reversed development-dependency cycle was ignored: {report}"
+    );
+    let helper = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "cycle_helper")
+        .expect("production helper diagnostic");
+    assert_eq!(helper["code"], "hawk::unnecessary_public");
+    assert_eq!(helper["test_only"], false);
+}
+
+#[test]
+fn library_production_targets_preserve_consumers_in_reversed_dev_dependency_cycles() {
+    assert_production_consumer_in_reversed_dev_dependency_cycle(false);
+}
+
+#[test]
+fn library_production_targets_preserve_consumers_when_cyclic_support_also_uses_the_product() {
+    assert_production_consumer_in_reversed_dev_dependency_cycle(true);
+}
+
+#[test]
+fn library_production_targets_distinguish_external_packages_with_workspace_names() {
+    let context = HawkTestContext::new("library_products");
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\npub fn used_only_by_dev_support() {\n    dev_support_helper();\n}\n\npub fn dev_support_helper() {}\n",
+    );
+    fs::write(library_path, library).expect("add dev-only library exports");
+    add_library_support_package(
+        &context,
+        "internal-api = { path = \"../api\" }\n",
+        "pub fn fixture() { internal_api::used_only_by_dev_support(); }\n",
+    );
+
+    let outside_support = tempfile::tempdir().expect("external support package directory");
+    fs::create_dir_all(outside_support.path().join("src"))
+        .expect("create external support package");
+    fs::write(
+        outside_support.path().join("Cargo.toml"),
+        "[package]\nname = \"support\"\nversion = \"0.2.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )
+    .expect("write external support manifest");
+    fs::write(
+        outside_support.path().join("src/lib.rs"),
+        "pub fn outside() {}\n",
+    )
+    .expect("write external support source");
+    let consumer_manifest_path = context.workspace().join("consumer/Cargo.toml");
+    let consumer_manifest = fs::read_to_string(&consumer_manifest_path)
+        .expect("read consumer manifest")
+        .replace(
+            "[dependencies]\n",
+            &format!(
+                "[dependencies]\noutside-support = {{ package = \"support\", path = \"{}\" }}\n",
+                outside_support.path().display()
+            ),
+        );
+    fs::write(consumer_manifest_path, consumer_manifest).expect("add external support dependency");
+    regenerate_fixture_lockfile(&context);
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array")
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "dev_support_helper")
+        .expect("dev-support-only helper diagnostic");
+    assert_eq!(diagnostic["code"], "hawk::unnecessary_public");
+    assert_eq!(diagnostic["test_only"], true);
+}
+
+#[test]
+fn library_production_targets_ignore_disabled_optional_dependencies() {
+    let context = HawkTestContext::new("library_products");
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\npub fn used_only_by_dev_support() {\n    dev_support_helper();\n}\n\npub fn dev_support_helper() {}\n",
+    );
+    fs::write(library_path, library).expect("add dev-only library exports");
+    add_library_support_package(
+        &context,
+        "internal-api = { path = \"../api\" }\n",
+        "pub fn fixture() { internal_api::used_only_by_dev_support(); }\n",
+    );
+
+    let consumer_manifest_path = context.workspace().join("consumer/Cargo.toml");
+    let consumer_manifest = fs::read_to_string(&consumer_manifest_path)
+        .expect("read consumer manifest")
+        .replace(
+            "[dependencies]\n",
+            "[dependencies]\nsupport = { path = \"../support\", optional = true }\n",
+        );
+    fs::write(consumer_manifest_path, consumer_manifest).expect("add optional support dependency");
+    let configuration_path = context.workspace().join("hawk.toml");
+    let mut configuration =
+        fs::read_to_string(&configuration_path).expect("read production configuration");
+    configuration.push_str(
+        "\n[[feature-profile]]\nname = \"without-support\"\nno-default-features = true\n",
+    );
+    fs::write(configuration_path, configuration).expect("add feature profile");
+    regenerate_fixture_lockfile(&context);
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array")
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "dev_support_helper")
+        .expect("dev-support-only helper diagnostic");
+    assert_eq!(diagnostic["code"], "hawk::unnecessary_public");
+    assert_eq!(diagnostic["test_only"], true);
+    assert_eq!(
+        report["summary"]["feature_profiles"],
+        serde_json::json!(["without-support"])
+    );
+}
+
+#[test]
+fn library_production_targets_preserve_every_selected_feature_variant() {
+    let context = HawkTestContext::new("library_products");
+    let workspace_manifest_path = context.workspace().join("Cargo.toml");
+    let workspace_manifest = fs::read_to_string(&workspace_manifest_path)
+        .expect("read workspace manifest")
+        .replace(
+            "members = [\"api\", \"consumer\"]",
+            "members = [\"api\", \"consumer\", \"feature-consumer\"]",
+        );
+    fs::write(workspace_manifest_path, workspace_manifest).expect("add feature-enabled consumer");
+
+    let library_manifest_path = context.workspace().join("api/Cargo.toml");
+    let mut library_manifest =
+        fs::read_to_string(&library_manifest_path).expect("read library manifest");
+    library_manifest.push_str("\n[features]\ndefault = []\nextra = []\n");
+    fs::write(library_manifest_path, library_manifest).expect("add optional library feature");
+
+    let library_path = context.workspace().join("api/src/lib.rs");
+    let mut library = fs::read_to_string(&library_path).expect("read library source");
+    library.push_str(
+        "\n#[cfg(feature = \"extra\")]\npub fn feature_api() {\n    feature_helper();\n}\n\n#[cfg(feature = \"extra\")]\npub fn feature_helper() {}\n",
+    );
+    fs::write(library_path, library).expect("add feature-enabled library declarations");
+
+    let consumer_manifest_path = context.workspace().join("consumer/Cargo.toml");
+    let consumer_manifest = fs::read_to_string(&consumer_manifest_path)
+        .expect("read consumer manifest")
+        .replace(
+            "internal-api = { path = \"../api\" }",
+            "internal-api = { path = \"../api\", default-features = false }",
+        );
+    fs::write(consumer_manifest_path, consumer_manifest)
+        .expect("disable optional API features in the first selected product");
+
+    let feature_consumer = context.workspace().join("feature-consumer");
+    fs::create_dir_all(feature_consumer.join("src"))
+        .expect("create feature-enabled consumer package");
+    fs::write(
+        feature_consumer.join("Cargo.toml"),
+        "[package]\nname = \"feature-consumer\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ninternal-api = { path = \"../api\", features = [\"extra\"] }\n",
+    )
+    .expect("write feature-enabled consumer manifest");
+    fs::write(
+        feature_consumer.join("src/lib.rs"),
+        "pub fn consume_extra() {\n    internal_api::feature_api();\n}\n",
+    )
+    .expect("write feature-enabled consumer source");
+
+    fs::write(
+        context.workspace().join("hawk.toml"),
+        "[[production]]\npackage = \"consumer\"\nlib = \"consumer\"\nreason = \"product with optional API features disabled\"\n\n[[production]]\npackage = \"internal-api\"\nlib = \"internal_api\"\nreason = \"product with every optional API feature enabled\"\n",
+    )
+    .expect("select both library feature variants");
+    regenerate_fixture_lockfile(&context);
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array");
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["identity"]["item"] == "feature_api"),
+        "a feature-enabled API used across the workspace was diagnosed: {report}"
+    );
+    let helper = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "feature_helper")
+        .expect("feature-enabled helper diagnostic");
+    assert_eq!(helper["code"], "hawk::unnecessary_public");
+    assert_eq!(helper["test_only"], false);
+}
+
+#[test]
+fn library_production_targets_support_explicit_rlib_crate_types() {
+    let context = HawkTestContext::new("library_products");
+    let library_manifest_path = context.workspace().join("api/Cargo.toml");
+    let mut library_manifest =
+        fs::read_to_string(&library_manifest_path).expect("read library manifest");
+    library_manifest.push_str("crate-type = [\"rlib\"]\n");
+    fs::write(library_manifest_path, library_manifest).expect("set explicit rlib crate type");
+
+    let output = context.run(&["--fix", "--allow-no-vcs"]);
+
+    context.assert_success(&output);
+    let library = fs::read_to_string(context.workspace().join("api/src/lib.rs"))
+        .expect("read fixed rlib source");
+    assert!(library.contains("fn used_only_within_crate()"));
+    assert!(!library.contains("pub fn used_only_within_crate()"));
+}
+
+#[test]
+fn library_production_targets_allow_unrelated_duplicate_workspace_crate_names() {
+    let context = HawkTestContext::new("library_products");
+    let workspace_manifest_path = context.workspace().join("Cargo.toml");
+    let workspace_manifest = fs::read_to_string(&workspace_manifest_path)
+        .expect("read workspace manifest")
+        .replace(
+            "members = [\"api\", \"consumer\"]",
+            "members = [\"api\", \"consumer\", \"duplicate-a\", \"duplicate-b\"]",
+        );
+    fs::write(workspace_manifest_path, workspace_manifest)
+        .expect("add unrelated duplicate workspace libraries");
+
+    for (package, function) in [
+        ("duplicate-a", "first_unrelated_export"),
+        ("duplicate-b", "second_unrelated_export"),
+    ] {
+        let package_path = context.workspace().join(package);
+        fs::create_dir_all(package_path.join("src")).expect("create unrelated library package");
+        fs::write(
+            package_path.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nname = \"shared\"\n"
+            ),
+        )
+        .expect("write unrelated library manifest");
+        fs::write(
+            package_path.join("src/lib.rs"),
+            format!("pub fn {function}() {{}}\n"),
+        )
+        .expect("write unrelated library source");
+    }
+    regenerate_fixture_lockfile(&context);
+
+    let output = context.run(&["--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .expect("diagnostics is an array")
+            .iter()
+            .all(|diagnostic| diagnostic["identity"]["crate"] == "internal_api"),
+        "unrelated duplicate libraries became diagnostic targets: {report}"
+    );
+}
+
+#[test]
+fn library_production_targets_ignore_unselected_workspace_expectations() {
+    let context = HawkTestContext::new("library_products");
+    let consumer_path = context.workspace().join("consumer/src/lib.rs");
+    let mut consumer = fs::read_to_string(&consumer_path).expect("read consumer source");
+    consumer.push_str("\npub fn unused_consumer() {}\n");
+    fs::write(consumer_path, consumer).expect("add unselected consumer export");
+    let configuration_path = context.workspace().join("hawk.toml");
+    let mut configuration =
+        fs::read_to_string(&configuration_path).expect("read production configuration");
+    configuration.push_str(
+        "\n[[override]]\nlint = \"hawk::dead_public\"\ncrate = \"consumer\"\nitem = \"unused_consumer\"\nlevel = \"expect\"\nreason = \"separate consumer package expectation\"\n",
+    );
+    fs::write(configuration_path, configuration).expect("add out-of-scope expectation");
+
+    let output = context.run(&["-A", "warnings", "-D", "hawk::unfulfilled_expectation"]);
+
+    context.assert_success(&output);
+}
+
+#[test]
+fn library_production_targets_select_the_requested_compilation_target() {
+    let rustc_version = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .expect("read Rust compiler version");
+    assert!(rustc_version.status.success());
+    let rustc_version = String::from_utf8(rustc_version.stdout).expect("Rust compiler version");
+    let host_target = rustc_version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("Rust compiler host target");
+    let host_arch = host_target
+        .split_once('-')
+        .expect("host target has an architecture")
+        .0;
+    let installed_targets = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .expect("list installed Rust targets");
+    assert!(installed_targets.status.success());
+    let installed_targets =
+        String::from_utf8(installed_targets.stdout).expect("installed Rust targets");
+    let Some(target) = installed_targets.lines().find(|target| {
+        target
+            .split_once('-')
+            .is_some_and(|(arch, _)| arch != host_arch)
+    }) else {
+        return;
+    };
+    let target_arch = target
+        .split_once('-')
+        .expect("target has an architecture")
+        .0;
+    let context = HawkTestContext::new("library_products");
+    fs::write(
+        context.workspace().join("api/src/lib.rs"),
+        format!(
+            "#[cfg(target_arch = \"{host_arch}\")]\npub fn host_api() {{ host_helper(); }}\n#[cfg(target_arch = \"{host_arch}\")]\npub fn host_helper() {{}}\n#[cfg(target_arch = \"{host_arch}\")]\npub fn host_only_unused() {{}}\n\n#[cfg(target_arch = \"{target_arch}\")]\npub fn target_api() {{ target_helper(); }}\n#[cfg(target_arch = \"{target_arch}\")]\npub fn target_helper() {{}}\n\npub fn unused() {{}}\n"
+        ),
+    )
+    .expect("write target-specific library source");
+    fs::write(
+        context.workspace().join("consumer/src/lib.rs"),
+        "pub fn consume() { internal_api::target_api(); }\n",
+    )
+    .expect("write target-specific consumer source");
+    fs::write(
+        context.workspace().join("consumer/build.rs"),
+        "fn main() { internal_api::host_api(); }\n",
+    )
+    .expect("write host-only build script");
+    let manifest_path = context.workspace().join("consumer/Cargo.toml");
+    let mut manifest = fs::read_to_string(&manifest_path).expect("read consumer manifest");
+    manifest.push_str("\n[build-dependencies]\ninternal-api = { path = \"../api\" }\n");
+    fs::write(manifest_path, manifest).expect("add host-only library dependency");
+    let configuration_path = context.workspace().join("hawk.toml");
+    let mut configuration =
+        fs::read_to_string(&configuration_path).expect("read production configuration");
+    configuration.push_str(
+        "\n[[production]]\npackage = \"consumer\"\nlib = \"consumer\"\nreason = \"cross-target workspace library consumer\"\n\n[[override]]\nlint = \"hawk::dead_public\"\ncrate = \"internal_api\"\nitem = \"host_only_unused\"\nlevel = \"expect\"\nreason = \"host-only export is not part of the selected target\"\n",
+    );
+    fs::write(configuration_path, configuration).expect("add consumer library product");
+
+    let output = context.run(&["--target", target, "--output-format=json"]);
+
+    context.assert_success(&output);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array");
+    let helper = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["identity"]["item"] == "target_helper")
+        .expect("target helper diagnostic");
+    assert_eq!(helper["code"], "hawk::unnecessary_public");
+    assert_eq!(helper["test_only"], false);
+    assert!(
+        !diagnostics.iter().any(|diagnostic| {
+            diagnostic["category"] == "finding"
+                && diagnostic["identity"]["item"] == "host_only_unused"
+        }),
+        "host-only declarations leaked into the target diagnostic surface: {report}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "hawk::unknown_item"),
+        "a host-only override was not diagnosed as unknown for the selected target: {report}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "hawk::unfulfilled_expectation"),
+        "a host-only override became an unfulfilled target expectation: {report}"
+    );
+}
+
+#[test]
+fn library_production_targets_apply_safe_visibility_fixes() {
+    let context = HawkTestContext::new("library_products");
+    let output = context.run(&["--fix", "--allow-no-vcs"]);
+
+    context.assert_success(&output);
+    let library = fs::read_to_string(context.workspace().join("api/src/lib.rs"))
+        .expect("read fixed library source");
+    assert!(library.contains("pub fn used_across_workspace()"));
+    assert!(
+        !library.contains("pub fn used_only_within_crate()")
+            && library.contains("fn used_only_within_crate()"),
+        "crate-local visibility was not reduced:\n{library}"
+    );
+    assert!(library.contains("pub fn unused()"));
+}
+
+#[test]
+fn mixed_binary_and_library_products_reuse_dependency_fragments() {
+    let context = HawkTestContext::new("production_consumers");
+    let configuration = context.workspace().join("hawk.toml");
+    let mut source = fs::read_to_string(&configuration).expect("read production configuration");
+    source.push_str(
+        "\n[[production]]\npackage = \"library\"\nlib = \"library\"\nreason = \"audit internal library exports\"\n",
+    );
+    fs::write(configuration, source).expect("add library production target");
+
+    let output = context.run(&[]);
+
+    context.assert_success(&output);
+    let stdout = context.normalized_stdout(&output);
+    assert!(stdout.contains("warning[hawk::dead_public]: `unused` is public"));
+    assert!(stdout.contains("3 configured production targets"));
+}
+
+#[test]
+fn rejects_unknown_library_production_targets() {
+    let context = HawkTestContext::new("library_products");
+    let configuration = context.workspace().join("hawk.toml");
+    fs::write(
+        configuration,
+        "[[production]]\npackage = \"internal-api\"\nlib = \"missing\"\nreason = \"invalid library\"\n",
+    )
+    .expect("write invalid library configuration");
+
+    let output = context.run(&[]);
+
+    assert!(!output.status.success());
+    assert!(
+        context
+            .normalized_stderr(&output)
+            .contains("package `internal-api` has no library target `missing`")
+    );
+}
+
+#[test]
 fn distinct_spanless_expansions_do_not_keep_a_library_item_live() {
     for binary_name in [None, Some("same")] {
         let context = HawkTestContext::new("spanless_target_collision");
@@ -835,6 +1971,22 @@ fn rejects_duplicate_workspace_library_crate_names() {
         "conflicting names: `shared` (`library-a`, `library-b`). Hawk identifies graph definitions and fix targets by crate name"
     ));
     assert!(stderr.contains("give each `[lib]` target a unique `name`"));
+}
+
+#[test]
+fn rejects_duplicate_audited_library_crate_names() {
+    let context = HawkTestContext::new("duplicate_library_names");
+    fs::write(
+        context.workspace().join("hawk.toml"),
+        "[[production]]\npackage = \"library-a\"\nlib = \"shared\"\nreason = \"library product under analysis\"\n",
+    )
+    .expect("select an ambiguous library product");
+
+    let output = context.run(&[]);
+
+    assert!(!output.status.success());
+    let stderr = context.normalized_stderr(&output);
+    assert!(stderr.contains("conflicting names: `shared` (`library-a`, `library-b`)"));
 }
 
 #[test]
@@ -927,7 +2079,7 @@ fn rejects_fixes_with_multiple_feature_profiles() {
 }
 
 #[test]
-fn requires_a_configured_production_binary() {
+fn requires_a_configured_production_target() {
     let context = HawkTestContext::new("basic");
     let configuration = tempfile::NamedTempFile::new().expect("temporary empty configuration");
     let output = context
@@ -941,7 +2093,7 @@ fn requires_a_configured_production_binary() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains('\u{1b}'));
     let stderr = anstream::adapter::strip_str(&stderr).to_string();
-    assert!(stderr.contains("error: no applicable production binaries configured"));
+    assert!(stderr.contains("error: no applicable production targets configured"));
 }
 
 #[test]
@@ -1027,7 +2179,7 @@ fn emits_versioned_json_diagnostics_and_keeps_cargo_output_on_stderr() {
     );
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
-    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["schema_version"], 4);
     assert_eq!(report["summary"]["diagnostic_count"], 41);
     assert_eq!(
         report["summary"]["production"],
@@ -1163,7 +2315,7 @@ fn emits_an_empty_json_report_when_all_warnings_are_allowed() {
     context.assert_success(&output);
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
-    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["schema_version"], 4);
     assert_eq!(report["summary"]["diagnostic_count"], 0);
     assert_eq!(report["diagnostics"], serde_json::json!([]));
 }
@@ -1447,7 +2599,7 @@ fn json_byte_offsets_delete_unicode_declarations() {
     context.assert_success(&output);
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
-    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["schema_version"], 4);
     let diagnostic = report["diagnostics"]
         .as_array()
         .expect("diagnostics is an array")
@@ -1509,7 +2661,7 @@ fn json_still_emits_a_report_when_stderr_is_closed() {
     assert!(output.stderr.is_empty());
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
-    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["schema_version"], 4);
 }
 
 #[cfg(unix)]
@@ -1817,7 +2969,7 @@ fn reports_operational_json_errors_on_stderr() {
     assert!(
         context
             .normalized_stderr(&output)
-            .contains("error: no applicable production binaries configured")
+            .contains("error: no applicable production targets configured")
     );
 }
 
@@ -2243,7 +3395,7 @@ fn reports_only_dead_public_findings_as_json() {
     context.assert_success(&output);
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
-    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["schema_version"], 4);
     assert_eq!(report["summary"]["diagnostic_count"], 17);
     let diagnostics = report["diagnostics"]
         .as_array()
