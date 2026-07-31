@@ -114,10 +114,19 @@ intentional uniform field visibility:
 preserve-uniform-field-visibility = true
 ```
 
-When every source-written field has the same visibility and at least one field
-semantically requires that visibility, Hawk does not suggest reducing the
-visibility of its siblings. The policy applies to public and restricted
-visibility reductions, but does not suppress `hawk::dead_public`.
+When every source-written field has the same visibility, Hawk preserves that
+visibility if at least one field requires it. Otherwise, Hawk applies the least
+aggressive available reduction to every field. For example, if one
+`pub(crate)` field requires `pub(super)` and another can be private, Hawk
+suggests `pub(super)` for both when `hawk::unnecessary_crate_visibility` is
+enabled. That lint is allow-by-default; without it, Hawk preserves the group's
+`pub(crate)` visibility. If every field can be private, Hawk reports that
+reduction for the full group. The policy does not suppress `hawk::dead_public`.
+
+Hawk conservatively preserves the current group when a source-written field is
+absent from the compiled graph, such as a `#[cfg]`-disabled field, or when a
+field opts out of analysis with `#[allow(dead_code)]`. Those fields cannot
+participate in a safe group-wide fix.
 
 This setting is disabled by default. It does not apply to mixed-visibility
 declarations or declarations whose complete source field list is unavailable,
