@@ -113,7 +113,7 @@ stderr and do not produce a JSON report:
   --output-format=json > hawk-report.json
 ```
 
-The JSON report is versioned with `schema_version` (currently `4`); breaking
+The JSON report is versioned with `schema_version` (currently `5`); breaking
 schema changes increment this version. Its `summary` describes the compilation
 target, configured production binaries or libraries, feature profiles,
 non-production coverage, and emitted diagnostic count.
@@ -137,8 +137,8 @@ When rustc cannot retain a complete range for a parsed attribute, such as
 `#[cold]` or `#[unsafe(link_section = "...")]`, the location intentionally
 falls back to `file`, `line`, and `column`; ending locations and byte offsets
 are omitted.
-Configuration diagnostics include the referenced
-lint and item, configuration location, and reason.
+Configuration diagnostics identify either the referenced lint and item or the
+excluded scope, along with the configuration location and reason.
 
 `--fix` supports the default profile or one explicitly configured feature
 profile. Hawk rejects fixing runs with a multi-profile matrix; run analysis

@@ -1007,7 +1007,7 @@ fn library_production_targets_are_described_in_json_reports() {
     context.assert_success(&output);
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
-    assert_eq!(report["schema_version"], 4);
+    assert_eq!(report["schema_version"], 5);
     assert_eq!(
         report["summary"]["production"],
         serde_json::json!([{"package": "internal-api", "library": "internal_api"}])
@@ -2300,6 +2300,57 @@ fn ordered_lint_levels_control_severity_and_exit_status() {
 }
 
 #[test]
+fn expected_exclusions_report_when_the_scope_suppresses_nothing() {
+    let context = HawkTestContext::new("basic");
+    fs::write(
+        context.workspace().join("hawk.toml"),
+        r#"
+[[production]]
+package = "app"
+bin = "app"
+reason = "binary product under analysis"
+
+[[exclude]]
+crate = "library"
+module = "consumed_outer"
+level = "expect"
+reason = "detect a stale broad exclusion"
+"#,
+    )
+    .expect("write expected exclusion configuration");
+
+    let output = context.run(&["-A", "warnings", "-D", "hawk::unfulfilled_expectation"]);
+
+    assert!(!output.status.success());
+    let stdout = context.normalized_stdout(&output);
+    assert!(stdout.contains(
+        "error[hawk::unfulfilled_expectation]: expected exclusion for module `library::consumed_outer`, but no finding was produced"
+    ));
+    assert!(stdout.contains("reason: detect a stale broad exclusion"));
+
+    let output = context.run(&[
+        "--output-format=json",
+        "-A",
+        "warnings",
+        "-D",
+        "hawk::unfulfilled_expectation",
+    ]);
+    assert!(!output.status.success());
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array")
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "hawk::unfulfilled_expectation")
+        .expect("unfulfilled exclusion diagnostic");
+    assert!(diagnostic["lint"].is_null());
+    assert_eq!(diagnostic["identity"]["crate"], "library");
+    assert_eq!(diagnostic["identity"]["selector"], "module");
+    assert_eq!(diagnostic["identity"]["value"], "consumed_outer");
+}
+
+#[test]
 fn later_warnings_group_reenables_default_warnings() {
     let context = HawkTestContext::new("basic");
     let output = context.run(&["-A", "warnings", "-D", "warnings"]);
@@ -2357,7 +2408,7 @@ fn emits_versioned_json_diagnostics_and_keeps_cargo_output_on_stderr() {
     );
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
-    assert_eq!(report["schema_version"], 4);
+    assert_eq!(report["schema_version"], 5);
     assert_eq!(report["summary"]["diagnostic_count"], 41);
     assert_eq!(
         report["summary"]["production"],
@@ -2493,7 +2544,7 @@ fn emits_an_empty_json_report_when_all_warnings_are_allowed() {
     context.assert_success(&output);
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
-    assert_eq!(report["schema_version"], 4);
+    assert_eq!(report["schema_version"], 5);
     assert_eq!(report["summary"]["diagnostic_count"], 0);
     assert_eq!(report["diagnostics"], serde_json::json!([]));
 }
@@ -2777,7 +2828,7 @@ fn json_byte_offsets_delete_unicode_declarations() {
     context.assert_success(&output);
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
-    assert_eq!(report["schema_version"], 4);
+    assert_eq!(report["schema_version"], 5);
     let diagnostic = report["diagnostics"]
         .as_array()
         .expect("diagnostics is an array")
@@ -2839,7 +2890,7 @@ fn json_still_emits_a_report_when_stderr_is_closed() {
     assert!(output.stderr.is_empty());
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
-    assert_eq!(report["schema_version"], 4);
+    assert_eq!(report["schema_version"], 5);
 }
 
 #[cfg(unix)]
@@ -3722,7 +3773,7 @@ fn reports_only_dead_public_findings_as_json() {
     context.assert_success(&output);
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains one JSON report");
-    assert_eq!(report["schema_version"], 4);
+    assert_eq!(report["schema_version"], 5);
     assert_eq!(report["summary"]["diagnostic_count"], 17);
     let diagnostics = report["diagnostics"]
         .as_array()
